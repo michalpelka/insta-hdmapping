@@ -84,6 +84,26 @@ if(UNIX AND NOT APPLE)
     # does not carry the transitive system libs GLFW itself needs (the X11/GLX
     # backend it was compiled against) — link them explicitly.
     target_link_libraries(calib_app PRIVATE GL m pthread dl rt X11)
+elseif(APPLE)
+    # Same situation as the Linux branch above, on the Cocoa/IOKit backend
+    # instead: raylib's own pkg-config output (raylib.pc, consumed by
+    # raylib-config.cmake's find_package(raylib)) doesn't carry these
+    # frameworks through to a downstream consumer for this bundled-GLFW
+    # static build, so the link fails with a wall of undefined AppKit/
+    # CoreFoundation/CoreGraphics/IOKit symbols unless they're listed here
+    # explicitly (confirmed against the actual undefined-symbol list from a
+    # failed link: NS*/objc_* from AppKit, CF* from CoreFoundation, CGDisplay*/
+    # CGEventSource* from CoreGraphics, IOHID*/IOService* from IOKit, and
+    # UCKeyTranslate — keyboard-layout-aware scancode names — from Carbon).
+    target_link_libraries(calib_app PRIVATE
+        "-framework Cocoa"
+        "-framework IOKit"
+        "-framework CoreFoundation"
+        "-framework CoreGraphics"
+        "-framework CoreVideo"
+        "-framework OpenGL"
+        "-framework Carbon"
+    )
 endif()
 
 if(MSVC)
