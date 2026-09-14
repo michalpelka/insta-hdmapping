@@ -22,7 +22,8 @@
 #include "Verification.h"
 
 #include <opencv2/opencv.hpp>
-#include <opencv2/aruco/charuco.hpp>
+
+#include "ArucoCompat.h"
 
 #include <algorithm>
 #include <cctype>
@@ -37,7 +38,7 @@ namespace {
 // Board dictionaries offered in the UI, same set as
 // /home/michal/fisheye/files(1)/show_charuco_4k.py's DICT_NAMES.
 constexpr const char* kDictNames[] = {"4X4_50", "5X5_100", "6X6_250", "7X7_1000", "APRILTAG_36h11"};
-constexpr cv::aruco::PREDEFINED_DICTIONARY_NAME kDictEnums[] = {
+constexpr cv::aruco::DictionaryName kDictEnums[] = {
     cv::aruco::DICT_4X4_50, cv::aruco::DICT_5X5_100, cv::aruco::DICT_6X6_250,
     cv::aruco::DICT_7X7_1000, cv::aruco::DICT_APRILTAG_36h11,
 };
@@ -56,7 +57,7 @@ struct BoardSettings {
     int markerPx  = 182;
 };
 
-// Keeps sanitized values within workable ranges (CharucoBoard::create()
+// Keeps sanitized values within workable ranges (CharucoBoard construction
 // requires markerLength < squareLength, and degenerate small boards have no
 // interior corners to detect).
 BoardSettings Sanitize(BoardSettings s) {
@@ -130,8 +131,14 @@ struct BoardState {
 
 BoardState BuildBoard(const BoardSettings& s) {
     BoardState b;
+#if INSTA360_CALIB_NEW_ARUCO_API
+    b.dict = cv::makePtr<cv::aruco::Dictionary>(cv::aruco::getPredefinedDictionary(kDictEnums[s.dictIndex]));
+    b.board = cv::makePtr<cv::aruco::CharucoBoard>(cv::Size(s.cols, s.rows), (float)s.squarePx,
+                                                    (float)s.markerPx, *b.dict);
+#else
     b.dict = cv::aruco::getPredefinedDictionary(kDictEnums[s.dictIndex]);
     b.board = cv::aruco::CharucoBoard::create(s.cols, s.rows, (float)s.squarePx, (float)s.markerPx, b.dict);
+#endif
     b.totalCorners = (s.cols - 1) * (s.rows - 1);
     return b;
 }
@@ -145,6 +152,24 @@ struct Detection {
 
 Detection DetectCharuco(const cv::Mat& bgr, const BoardState& b) {
     Detection d;
+#if INSTA360_CALIB_NEW_ARUCO_API
+    cv::aruco::DetectorParameters params;
+    params.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
+    // Fisheye-distorted squares curve a lot near the image edge; widen the
+    // adaptive-threshold window range so markers there still binarize cleanly.
+    params.adaptiveThreshWinSizeMin = 5;
+    params.adaptiveThreshWinSizeMax = 35;
+    params.adaptiveThreshWinSizeStep = 5;
+
+    cv::aruco::ArucoDetector detector(*b.dict, params);
+    std::vector<std::vector<cv::Point2f>> rejected;
+    detector.detectMarkers(bgr, d.markerCorners, d.markerIds, rejected);
+
+    if (!d.markerIds.empty()) {
+        cv::aruco::CharucoDetector charucoDetector(*b.board);
+        charucoDetector.detectBoard(bgr, d.charucoCorners, d.charucoIds, d.markerCorners, d.markerIds);
+    }
+#else
     auto params = cv::aruco::DetectorParameters::create();
     params->cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
     // Fisheye-distorted squares curve a lot near the image edge; widen the
@@ -160,6 +185,7 @@ Detection DetectCharuco(const cv::Mat& bgr, const BoardState& b) {
         cv::aruco::interpolateCornersCharuco(d.markerCorners, d.markerIds, bgr, b.board,
                                               d.charucoCorners, d.charucoIds);
     }
+#endif
     return d;
 }
 

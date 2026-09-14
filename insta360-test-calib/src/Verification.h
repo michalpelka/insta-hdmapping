@@ -1,8 +1,8 @@
 #pragma once
 
+#include "ArucoCompat.h"
 #include "MeiCamera.h"
 
-#include <opencv2/aruco/charuco.hpp>
 #include <opencv2/core.hpp>
 
 #include <string>

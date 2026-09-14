@@ -7,7 +7,13 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs aruco calib3d)
+# Not pinned to specific COMPONENTS: OpenCV 4.7 folded "aruco" into
+# "objdetect" and OpenCV 5.0 split "calib3d" into "calib"/"geometry"/"stereo",
+# so a fixed component list fails find_package on one CI runner or the other
+# depending on which OpenCV they get (see ArucoCompat.h for the matching
+# source-level split). Un-scoped find_package instead pulls in whatever
+# modules that install actually has and links them all via ${OpenCV_LIBS}.
+find_package(OpenCV REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 # raylib is installed system-wide but only as a static archive

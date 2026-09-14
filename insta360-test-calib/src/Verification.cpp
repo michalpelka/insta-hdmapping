@@ -23,6 +23,14 @@ VerificationResult VerifyPose(const cv::Mat& charucoCorners, const cv::Mat& char
         return r;
     }
 
+    // CharucoBoard::chessboardCorners is a public field pre-4.7, and the
+    // getChessboardCorners() accessor from 4.7 on -- see ArucoCompat.h.
+#if INSTA360_CALIB_NEW_ARUCO_API
+    const std::vector<cv::Point3f> chessboardCorners = board->getChessboardCorners();
+#else
+    const std::vector<cv::Point3f>& chessboardCorners = board->chessboardCorners;
+#endif
+
     // Bearing-vector PnP: undo this camera's own (wide-FOV, non-pinhole)
     // distortion to get each detected corner's ray direction, then hand
     // solvePnP the ray's (x/z, y/z) as if K were the identity — a point at
@@ -41,7 +49,7 @@ VerificationResult VerifyPose(const cv::Mat& charucoCorners, const cv::Mat& char
         double thetaDeg = 0.0;
         const cv::Point3d ray = cam.Unproject(cv::Point2d(p.x, p.y), &thetaDeg);
         maxThetaDeg = std::max(maxThetaDeg, thetaDeg);
-        objPts.push_back(board->chessboardCorners[id]);
+        objPts.push_back(chessboardCorners[id]);
         bearing2d.emplace_back((float)(ray.x / ray.z), (float)(ray.y / ray.z));
     }
     if (maxThetaDeg > 80.0) {
@@ -73,9 +81,9 @@ VerificationResult VerifyPose(const cv::Mat& charucoCorners, const cv::Mat& char
 
     // Full board grid, so the overlay can show where every corner is
     // predicted to be — including ones that weren't detected.
-    r.allReprojected.resize(board->chessboardCorners.size());
-    for (size_t id = 0; id < board->chessboardCorners.size(); ++id) {
-        const cv::Point2d pr = reproject(board->chessboardCorners[id]);
+    r.allReprojected.resize(chessboardCorners.size());
+    for (size_t id = 0; id < chessboardCorners.size(); ++id) {
+        const cv::Point2d pr = reproject(chessboardCorners[id]);
         r.allReprojected[id] = cv::Point2f((float)pr.x, (float)pr.y);
     }
 
