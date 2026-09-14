@@ -1,0 +1,46 @@
+name: insta360-to-images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'insta360-to-images/**'
+      - '.github/workflows/insta360-to-images.yml'
+  pull_request:
+    paths:
+      - 'insta360-to-images/**'
+      - '.github/workflows/insta360-to-images.yml'
+
+defaults:
+  run:
+    working-directory: insta360-to-images
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopencv-dev ffmpeg
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install opencv ffmpeg
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

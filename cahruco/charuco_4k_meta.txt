@@ -1,0 +1,8 @@
+cols=14
+rows=8
+dict=5X5_100
+square_px=260
+marker_px=182
+screen_w=3840
+screen_h=2160
+margin=40

@@ -1,0 +1,37 @@
+# Build output
+build/
+out/
+cmake-build-*/
+compile_commands.json
+
+# In case CMake is ever run in-source instead of into build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+
+# Compiled objects and binaries
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.exe
+*.out
+
+# Core dumps
+core
+core.*
+
+# Editors / tooling
+.cache/
+.clangd/
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

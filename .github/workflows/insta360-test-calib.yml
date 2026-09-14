@@ -1,0 +1,75 @@
+name: insta360-test-calib
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'insta360-test-calib/**'
+      - '.github/workflows/insta360-test-calib.yml'
+  pull_request:
+    paths:
+      - 'insta360-test-calib/**'
+      - '.github/workflows/insta360-test-calib.yml'
+
+defaults:
+  run:
+    working-directory: insta360-test-calib
+
+env:
+  RAYLIB_VERSION: '5.5'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # OpenCV (core/imgproc/imgcodecs/aruco/calib3d), yaml-cpp, and the X11/GL
+      # headers raylib's static build needs on Linux (raylib bundles its own
+      # GLFW source, so no glfw dev package is needed).
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libopencv-dev libyaml-cpp-dev \
+            libgl1-mesa-dev libx11-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libxi-dev libxext-dev pkg-config
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install opencv yaml-cpp
+
+      # No package manager ships raylib as a static library (this project
+      # requires raylib_USE_STATIC_LIBS), so build the pinned version from
+      # source, matching how it's installed on developer machines.
+      - name: Cache raylib build
+        id: raylib-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/raylib-install
+          key: raylib-${{ env.RAYLIB_VERSION }}-${{ runner.os }}-v1
+
+      - name: Build raylib ${{ env.RAYLIB_VERSION }} (static)
+        if: steps.raylib-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch "${RAYLIB_VERSION}" --depth 1 https://github.com/raysan5/raylib.git "${{ runner.temp }}/raylib-src"
+          cmake -S "${{ runner.temp }}/raylib-src" -B "${{ runner.temp }}/raylib-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_INSTALL_PREFIX="${{ runner.temp }}/raylib-install"
+          cmake --build "${{ runner.temp }}/raylib-build" -j
+          cmake --install "${{ runner.temp }}/raylib-build"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${{ runner.temp }}/raylib-install"
+
+      - name: Build
+        run: cmake --build build -j

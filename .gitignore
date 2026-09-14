@@ -1,0 +1,42 @@
+# Build output (CMake, out-of-source or accidental in-source)
+build/
+out/
+cmake-build-*/
+compile_commands.json
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+
+# Compiled objects and binaries
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.exe
+*.out
+
+# Core dumps
+core
+core.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editors / tooling
+.cache/
+.clangd/
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

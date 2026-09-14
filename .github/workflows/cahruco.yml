@@ -1,0 +1,42 @@
+name: cahruco
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cahruco/**'
+      - '.github/workflows/cahruco.yml'
+  pull_request:
+    paths:
+      - 'cahruco/**'
+      - '.github/workflows/cahruco.yml'
+
+defaults:
+  run:
+    working-directory: cahruco
+
+jobs:
+  smoke-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install opencv-contrib-python numpy
+
+      - name: Compile check
+        run: python -m py_compile show_charuco_4k.py
+
+      - name: Generate a board (headless, --save-only)
+        run: |
+          python show_charuco_4k.py --save-only --width 640 --height 360 --out board.png
+          test -s board.png
+          test -s board_meta.txt
