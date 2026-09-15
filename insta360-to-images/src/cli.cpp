@@ -46,8 +46,8 @@ std::string human_bytes(double size) {
     return out.str();
 }
 
-// std::stod stops at the first character it cannot use, so "1,5" would quietly parse
-// as 1. This insists the whole value was consumed.
+// std::stod/std::stoll stop at the first character they cannot use, so "1,5" would
+// quietly parse as 1. Both of these insist the whole value was consumed.
 double parse_seconds(const std::string& text, const std::string& flag) {
     try {
         size_t consumed = 0;
@@ -56,6 +56,21 @@ double parse_seconds(const std::string& text, const std::string& flag) {
     } catch (const std::exception&) {
     }
     throw std::invalid_argument(flag + " '" + text + "' is not a number of seconds");
+}
+
+int64_t parse_count(const std::string& text, const std::string& flag, int64_t minimum) {
+    int64_t value = 0;
+    try {
+        size_t consumed = 0;
+        value = std::stoll(text, &consumed);
+        if (consumed != text.size()) throw std::invalid_argument("");
+    } catch (const std::exception&) {
+        throw std::invalid_argument(flag + " '" + text + "' is not a whole number");
+    }
+    if (value < minimum) {
+        throw std::invalid_argument(flag + " must be at least " + std::to_string(minimum));
+    }
+    return value;
 }
 
 void print_usage() {
@@ -68,6 +83,8 @@ void print_usage() {
                  "default 3\n"
               << "  --scale SPEC            downscale frames: a factor (0.5) or WIDTHxHEIGHT\n"
               << "  --max-frames N          stop after N video frames\n"
+              << "  --frame-step N          export only every Nth frame; default 1 (every "
+                 "frame)\n"
               << "  --swap-lenses           map the second video track to cam_front\n"
               << "  --no-imu                leave out imu.csv\n"
               << "  --no-camera-info        leave out the per-camera intrinsics sidecar\n"
@@ -95,6 +112,7 @@ struct ParsedArgs {
     int jpeg_quality = 3;
     std::optional<std::string> scale;
     std::optional<int64_t> max_frames;
+    int64_t frame_step = 1;
     bool swap_lenses = false;
     bool include_imu = true;
     bool include_camera_info = true;
@@ -135,6 +153,8 @@ std::optional<ParsedArgs> parse_args(int argc, char** argv) {
             args.scale = next_value(i, token);
         } else if (token == "--max-frames") {
             args.max_frames = std::stoll(next_value(i, token));
+        } else if (token == "--frame-step") {
+            args.frame_step = parse_count(next_value(i, token), token, 1);
         } else if (token == "--swap-lenses") {
             args.swap_lenses = true;
         } else if (token == "--no-imu") {
@@ -343,6 +363,7 @@ int main(int argc, char** argv) {
     options.jpeg_quality = args.jpeg_quality;
     options.scale = args.scale;
     options.max_frames = args.max_frames;
+    options.frame_step = args.frame_step;
     options.swap_lenses = args.swap_lenses;
     options.relative_time = args.relative_time;
     options.time_offset_s = args.time_offset_s;

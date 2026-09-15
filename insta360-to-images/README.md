@@ -53,6 +53,7 @@ Run `insta360-to-images --help` for the full set. The useful ones:
 | `--jpeg-quality N` | ffmpeg MJPEG quality, 2 (best) to 31. Default 3. |
 | `--scale SPEC` | `0.5` or `1440x1440`. Intrinsics are rescaled to match. |
 | `--max-frames N` | Stop after N frames. |
+| `--frame-step N` | Export only every Nth frame (1 = all, the default). Counts source frames, so `--max-frames 100 --frame-step 5` writes 20 images per lens. |
 | `--swap-lenses` | Map the second video track to `cam_front`. |
 | `--no-imu` / `--no-camera-info` / `--no-panorama` | Leave out `imu.csv` / the intrinsics sidecar / `panorama.jpg`. |
 | `--no-equirect` | Skip stitching the geometric per-frame equirect video (on by default, compute-heavy). |
@@ -89,6 +90,11 @@ use, and applies to everything stamped with a time: the frame filenames, the
 `equirect/` filenames, and the `imu.csv` rows all move together, so the streams stay
 aligned with each other. Use it when the camera's own clock is known to be off
 against whatever else you are logging.
+
+`--frame-step N` thins the export to every Nth frame -- `--frame-step 5` on a 30 fps
+clip leaves 6 images per second per lens, and skips the equirect stitch for the
+dropped frames along with them. The kept frames keep their real timestamps, so the
+filenames stay directly comparable to a full export; `imu.csv` is never thinned.
 
 ### `panorama.jpg`
 

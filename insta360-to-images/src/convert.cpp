@@ -212,6 +212,7 @@ std::pair<int, int> resolve_scale(const std::optional<std::string>& spec, int wi
 
 Summary convert(const Options& options, const std::function<void(const std::string&)>& log) {
     require_tools();
+    if (options.frame_step < 1) throw std::invalid_argument("frame step must be at least 1");
     Summary summary;
     summary.output_dir = options.output_dir;
 
@@ -381,7 +382,15 @@ Summary convert(const Options& options, const std::function<void(const std::stri
         }
         int64_t total = static_cast<int64_t>(frames.device_us.size());
         int64_t step = std::max<int64_t>(1, total / 10);
-        int64_t written = 0;
+        // Progress counts frames read off the pipes, which with --frame-step is more than
+        // the number written.
+        auto report_progress = [&](int64_t done) {
+            if (done % step != 0 && done != total) return;
+            std::ostringstream progress;
+            progress << "  video " << done << "/" << total << " frames ("
+                     << (100.0 * done / total) << "%)";
+            log(progress.str());
+        };
         for (int64_t index = 0; index < total; ++index) {
             std::vector<std::optional<std::vector<uint8_t>>> frame_data;
             bool any_missing = false;
@@ -404,6 +413,14 @@ Summary convert(const Options& options, const std::function<void(const std::stri
                 break;
             }
             int64_t log_time = time_of(frames.device_us[index]);
+            // Every frame still has to be pulled off both pipes to keep the two lenses in
+            // lockstep; --frame-step only decides which of them reach the disk, which is
+            // where the equirect stitch (the expensive part) is skipped too.
+            if (index % options.frame_step != 0) {
+                last_ns = std::max(last_ns, log_time);
+                report_progress(index + 1);
+                continue;
+            }
             for (size_t i = 0; i < cameras.size(); ++i) {
                 // camera.name is "cam_front"/"cam_back"; the exported file itself is
                 // prefixed with just "front_"/"back_" so it reads well on its own once
@@ -439,13 +456,7 @@ Summary convert(const Options& options, const std::function<void(const std::stri
                 summary.counts["equirect"]++;
             }
             last_ns = std::max(last_ns, log_time);
-            written = index + 1;
-            if (written % step == 0 || written == total) {
-                std::ostringstream progress;
-                progress << "  video " << written << "/" << total << " frames ("
-                         << (100.0 * written / total) << "%)";
-                log(progress.str());
-            }
+            report_progress(index + 1);
         }
     }
 
