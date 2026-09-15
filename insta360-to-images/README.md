@@ -147,7 +147,11 @@ no stereo rectification is defined for a back-to-back fisheye pair -- and the 3x
 `p`), plus the fields a plain `CameraInfo` message has no room for: `xi` (the Mei
 model's mirror parameter) and `distortion` (`k1`, `k2`, `k3`, `p1`, `p2`, under
 `distortion_model: "insta360_mei_v2"`), and the per-lens `rotation_deg`/`translation`
-the camera reports (not a calibrated IMU-to-camera extrinsic). Note `k`/`p` are the
+the camera reports (not a calibrated IMU-to-camera extrinsic). It also carries the
+camera body's identity as quoted strings -- `serial`, `model` and `firmware`, each
+`null` on a file whose metadata record omits it -- the same three values the run
+banner prints, repeated in every camera's sidecar so a directory of frames identifies
+the body and firmware it came off without the source `.insv`. Note `k`/`p` are the
 ordinary pinhole matrices built from `fx`/`fy`/`cx`/`cy` alone -- they do *not*
 capture `xi` or the distortion, so they're only a rough pinhole approximation near
 the lens center, not something to feed `cv::undistort`. The `equirect/` output (see

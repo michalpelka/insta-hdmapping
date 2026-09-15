@@ -61,6 +61,10 @@ struct Camera {
     int video_index;
     fs::path dir;
     int width, height;
+    // Camera body identity, from the metadata record; any of these can be absent.
+    std::optional<std::string> serial;
+    std::optional<std::string> model;
+    std::optional<std::string> firmware;
     std::optional<LensCalibration> calibration;
 };
 
@@ -89,6 +93,19 @@ std::string yaml_number(double value) {
     return out.str();
 }
 
+// Double-quoted scalar: a serial like "0123" must not come back as a number, and
+// the camera is free to put anything in that field.
+std::string yaml_string(const std::string& text) {
+    std::ostringstream out;
+    out << '"';
+    for (char c : text) {
+        if (c == '"' || c == '\\') out << '\\';
+        out << c;
+    }
+    out << '"';
+    return out.str();
+}
+
 std::string yaml_array(const std::vector<double>& values) {
     std::ostringstream out;
     out << "[";
@@ -104,6 +121,9 @@ void write_camera_info(const fs::path& path, const Camera& camera) {
     const LensCalibration& lens = *camera.calibration;
     std::ofstream out(path);
     out << "frame_id: insta360_" << camera.name << "_optical_frame\n";
+    out << "serial: " << (camera.serial ? yaml_string(*camera.serial) : "null") << "\n";
+    out << "model: " << (camera.model ? yaml_string(*camera.model) : "null") << "\n";
+    out << "firmware: " << (camera.firmware ? yaml_string(*camera.firmware) : "null") << "\n";
     out << "video_stream_index: " << camera.video_index << "\n";
     out << "width: " << camera.width << "\n";
     out << "height: " << camera.height << "\n";
@@ -292,6 +312,9 @@ Summary convert(const Options& options, const std::function<void(const std::stri
         camera.dir = output_dir / camera.name;
         camera.width = out_width;
         camera.height = out_height;
+        camera.serial = meta.serial;
+        camera.model = meta.model;
+        camera.firmware = meta.firmware;
         auto it = lenses.find(video_index);
         if (it != lenses.end()) camera.calibration = it->second;
         fs::create_directories(camera.dir);
