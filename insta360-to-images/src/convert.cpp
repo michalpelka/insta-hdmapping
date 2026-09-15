@@ -43,17 +43,20 @@ std::string lower(std::string text) {
 // Maps camera device microseconds to the nanosecond stamps written to disk.
 class TimeBase {
 public:
-    TimeBase(std::optional<Clock> clock, int64_t origin_us, bool relative)
-        : clock_(relative ? std::nullopt : clock), origin_us_(origin_us) {}
+    TimeBase(std::optional<Clock> clock, int64_t origin_us, bool relative, double offset_s)
+        : clock_(relative ? std::nullopt : clock),
+          origin_us_(origin_us),
+          offset_ns_(static_cast<int64_t>(std::llround(offset_s * 1e9))) {}
 
     int64_t operator()(int64_t device_us) const {
-        if (clock_) return clock_->to_epoch_ns(device_us);
-        return (device_us - origin_us_) * 1000;
+        if (clock_) return clock_->to_epoch_ns(device_us) + offset_ns_;
+        return (device_us - origin_us_) * 1000 + offset_ns_;
     }
 
 private:
     std::optional<Clock> clock_;
     int64_t origin_us_;
+    int64_t offset_ns_;  // whole-timeline shift from Options::time_offset_s
 };
 
 struct Camera {
@@ -288,7 +291,7 @@ Summary convert(const Options& options, const std::function<void(const std::stri
     if (!clock && !options.relative_time) {
         summary.warnings.push_back("metadata carries no wall-clock reference; timestamps start at zero");
     }
-    TimeBase time_of(clock, origin_us, options.relative_time || !clock);
+    TimeBase time_of(clock, origin_us, options.relative_time || !clock, options.time_offset_s);
 
     // -- lenses -----------------------------------------------------------------
     std::vector<int> lens_order(container_probe.video.size());

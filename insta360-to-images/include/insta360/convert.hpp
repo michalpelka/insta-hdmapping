@@ -19,6 +19,7 @@ struct Options {
     std::optional<int64_t> max_frames;
     bool swap_lenses = false;
     bool relative_time = false;
+    double time_offset_s = 0.0;  // added to every timestamp written (frames and imu.csv)
     bool include_imu = true;
     bool include_camera_info = true;
     bool include_panorama = true;

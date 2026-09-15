@@ -59,6 +59,7 @@ Run `insta360-to-images --help` for the full set. The useful ones:
 | `--equirect-width N` | Equirect output width; height is always `N/2`. Default 3840. |
 | `--no-equirect-flip` | Don't rotate the equirect output 180 degrees; row 0 becomes the north pole instead of the south pole. The flip is on by default and, when applied, is a full rotation, not a mirror flip -- see below. |
 | `--relative-time` | Start timestamps at zero instead of the capture wall clock. |
+| `--time-offset SECONDS` | Shift every written timestamp by SECONDS (fractional and negative both accepted), to align the clip against another clock. |
 | `-f`, `--force` | Write into a non-empty output directory. |
 
 ## Output layout
@@ -82,6 +83,12 @@ Run `insta360-to-images --help` for the full set. The useful ones:
 
 With `--relative-time`, filenames and `imu.csv` timestamps count nanoseconds from the
 start of the clip instead of epoch nanoseconds.
+
+`--time-offset` adds a fixed shift on top of whichever of those two time bases is in
+use, and applies to everything stamped with a time: the frame filenames, the
+`equirect/` filenames, and the `imu.csv` rows all move together, so the streams stay
+aligned with each other. Use it when the camera's own clock is known to be off
+against whatever else you are logging.
 
 ### `panorama.jpg`
 

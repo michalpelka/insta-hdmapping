@@ -46,6 +46,18 @@ std::string human_bytes(double size) {
     return out.str();
 }
 
+// std::stod stops at the first character it cannot use, so "1,5" would quietly parse
+// as 1. This insists the whole value was consumed.
+double parse_seconds(const std::string& text, const std::string& flag) {
+    try {
+        size_t consumed = 0;
+        double value = std::stod(text, &consumed);
+        if (consumed == text.size() && std::isfinite(value)) return value;
+    } catch (const std::exception&) {
+    }
+    throw std::invalid_argument(flag + " '" + text + "' is not a number of seconds");
+}
+
 void print_usage() {
     std::cout << kDescription << "\n"
               << "Usage: insta360-to-images <input.insv> -o <output_dir> [options]\n\n"
@@ -69,6 +81,8 @@ void print_usage() {
               << "                          north pole instead of south)\n"
               << "  --relative-time         start timestamps at zero instead of the camera's "
                  "wall clock\n"
+              << "  --time-offset SECONDS   shift every written timestamp by SECONDS; may be\n"
+              << "                          fractional or negative\n"
               << "  -f, --force             write into a non-empty output directory\n"
               << "  -q, --quiet             only report warnings and errors\n"
               << "  -h, --help              show this help\n";
@@ -89,6 +103,7 @@ struct ParsedArgs {
     int equirect_width = 3840;
     bool equirect_flip = true;
     bool relative_time = false;
+    double time_offset_s = 0.0;
     bool force = false;
     bool quiet = false;
 };
@@ -140,6 +155,8 @@ std::optional<ParsedArgs> parse_args(int argc, char** argv) {
             args.equirect_flip = false;
         } else if (token == "--relative-time") {
             args.relative_time = true;
+        } else if (token == "--time-offset") {
+            args.time_offset_s = parse_seconds(next_value(i, token), token);
         } else if (token == "-f" || token == "--force") {
             args.force = true;
         } else if (token == "-q" || token == "--quiet") {
@@ -328,6 +345,7 @@ int main(int argc, char** argv) {
     options.max_frames = args.max_frames;
     options.swap_lenses = args.swap_lenses;
     options.relative_time = args.relative_time;
+    options.time_offset_s = args.time_offset_s;
     options.include_imu = args.include_imu;
     options.include_camera_info = args.include_camera_info;
     options.include_panorama = args.include_panorama;
