@@ -15,6 +15,8 @@ endif()
 # modules that install actually has and links them all via ${OpenCV_LIBS}.
 find_package(OpenCV REQUIRED)
 find_package(yaml-cpp REQUIRED)
+# 2.1+ for ceres::Manifold (SubsetManifold holds calibration parameters fixed).
+find_package(Ceres 2.1 REQUIRED)
 
 # raylib is installed system-wide but only as a static archive
 # (/usr/local/lib/libraylib.a, no .so) — use the static variant of its
@@ -64,19 +66,28 @@ if(NOT rlimgui_POPULATED)
     target_link_libraries(rlimgui PUBLIC raylib imgui)
 endif()
 
-add_executable(calib_app
-    src/main.cpp
-    src/MeiCamera.cpp
+# Everything except the UI: board detection, the camera model, pose
+# verification and (Ceres-based) calibration. Split out of calib_app so
+# tests/ can link it without pulling in raylib/imgui.
+add_library(calib_core STATIC
+    src/Board.cpp
+    src/Calibration.cpp
+    src/Camera.cpp
+    src/ImageSet.cpp
     src/Verification.cpp
 )
+target_include_directories(calib_core PUBLIC src ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(calib_core PUBLIC yaml-cpp::yaml-cpp Ceres::ceres ${OpenCV_LIBS})
 
-target_include_directories(calib_app PRIVATE src ${OpenCV_INCLUDE_DIRS})
+add_executable(calib_app
+    src/main.cpp
+)
+
 target_link_libraries(calib_app PRIVATE
+    calib_core
     raylib
     imgui
     rlimgui
-    yaml-cpp::yaml-cpp
-    ${OpenCV_LIBS}
 )
 
 if(UNIX AND NOT APPLE)
@@ -106,8 +117,18 @@ elseif(APPLE)
     )
 endif()
 
-if(MSVC)
-    target_compile_options(calib_app PRIVATE /W4)
-else()
-    target_compile_options(calib_app PRIVATE -Wall -Wextra)
+foreach(target calib_core calib_app)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra)
+    endif()
+endforeach()
+
+option(CALIB_APP_BUILD_TESTS "Build the calib_core unit tests" ON)
+if(CALIB_APP_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
 endif()
+
+install(TARGETS calib_app RUNTIME DESTINATION bin)

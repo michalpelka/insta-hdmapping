@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ArucoCompat.h"
-#include "MeiCamera.h"
+#include "Camera.h"
 
 #include <opencv2/core.hpp>
 
@@ -32,11 +32,15 @@ struct VerificationResult {
     double meanErrorPx = 0.0, rmsErrorPx = 0.0, maxErrorPx = 0.0;
 };
 
-// Estimates the board's pose from its detected corners (via a bearing-vector
-// PnP solve that undoes the camera's own distortion first, so it works for
-// this wide-FOV model instead of assuming a pinhole) and reprojects every
-// board corner through `cam` for comparison against what was actually
-// detected. Requires `cam.loaded` and at least kMinCorners detected corners;
-// otherwise returns a result with ok=false and an explanatory message.
+// Fewest detected corners VerifyPose (and calibration) will use from one
+// image: solvePnP is happy with 4, a few more for stability.
+constexpr int kMinVerifyCorners = 6;
+
+// Estimates the board's pose from its detected corners with the intrinsics
+// held fixed (EstimateBoardPose: bearing-vector PnP, then refinement of the
+// pixel reprojection error) and reprojects every board corner through `cam`
+// for comparison against what was actually detected. Requires `cam.loaded`
+// and at least kMinVerifyCorners detected corners; otherwise returns a result
+// with ok=false and an explanatory message.
 VerificationResult VerifyPose(const cv::Mat& charucoCorners, const cv::Mat& charucoIds,
-                               const cv::Ptr<cv::aruco::CharucoBoard>& board, const MeiCamera& cam);
+                               const cv::Ptr<cv::aruco::CharucoBoard>& board, const CameraIntrinsics& cam);

@@ -1,193 +1,49 @@
-// calib_app — fisheye calibration verification viewer.
+// calib_app — camera calibration and calibration verification.
 //
-// Loads one image, detects the ChArUco board in it with OpenCV, loads the
-// camera's Mei/omnidirectional intrinsics from data/camera_info.yaml,
-// estimates the board's pose from the detected corners and reprojects the
-// whole board grid through those intrinsics — so miscalibration shows up as
-// detected (green) and reprojected (red) corners visibly disagreeing. Board
-// layout and everything else is editable at runtime via ImGui panels.
+// Loads a set of images of a ChArUco board and detects the board in each with
+// OpenCV. Against the camera's intrinsics (camera_info.yaml: the Insta360 rig's
+// Mei model or one of OpenCV's standard models, see Camera.h) it then
+//   - verifies them: each image's board pose is estimated from its detected
+//     corners and the whole board grid is reprojected through the
+//     intrinsics, so miscalibration shows up as detected (green) and
+//     reprojected (blue) corners visibly disagreeing, and
+//   - re-estimates them: a joint Ceres fit of the chosen model's intrinsics
+//     over every image selected for calibration, starting from the loaded
+//     camera_info.yaml (or a generic guess), whose result can be made the
+//     active camera and saved as a new camera_info.yaml.
+// Board layout and everything else is editable at runtime via ImGui panels.
 //
 // Usage:
-//   calib_app [image_path] [camera_info_yaml_path]
-// With no arguments, starts with nothing loaded — drop an image, a
-// camera_info.yaml, and/or a charuco meta.txt onto the window (or pass paths
-// above / drop them in later; each can be provided independently).
+//   calib_app [path ...]
+// Each path may be an image, a folder (its images plus its camera_info.yaml —
+// e.g. an insta360-to-images cam_front/ directory), a camera_info.yaml or a
+// charuco meta.txt, in any order; files dropped onto the window are handled
+// the same way. With no arguments, starts with nothing loaded.
 
 #include "raylib.h"
 
 #include "imgui.h"
 #include "rlImGui.h"
 
-#include "MeiCamera.h"
+#include "Board.h"
+#include "ImageSet.h"
+#include "Calibration.h"
+#include "Camera.h"
 #include "Verification.h"
 
 #include <opencv2/opencv.hpp>
 
-#include "ArucoCompat.h"
-
 #include <algorithm>
-#include <cctype>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
-#include <fstream>
+#include <filesystem>
 #include <string>
 #include <vector>
 
 namespace {
 
-// Board dictionaries offered in the UI, same set as
-// /home/michal/fisheye/files(1)/show_charuco_4k.py's DICT_NAMES.
-constexpr const char* kDictNames[] = {"4X4_50", "5X5_100", "6X6_250", "7X7_1000", "APRILTAG_36h11"};
-constexpr cv::aruco::DictionaryName kDictEnums[] = {
-    cv::aruco::DICT_4X4_50, cv::aruco::DICT_5X5_100, cv::aruco::DICT_6X6_250,
-    cv::aruco::DICT_7X7_1000, cv::aruco::DICT_APRILTAG_36h11,
-};
-constexpr int kDictCount = 5;
-
-// Editable ChArUco board layout. Defaults mirror
-// /home/michal/fisheye/files(1)/charuco_4k_meta.txt, the metadata written
-// alongside the board image (charuco_4k.png) by show_charuco_4k.py when the
-// target was generated — update the UI values if the board is regenerated
-// with different settings.
-struct BoardSettings {
-    int dictIndex = 1; // 5X5_100
-    int cols      = 14;
-    int rows      = 8;
-    int squarePx  = 260;
-    int markerPx  = 182;
-};
-
-// Keeps sanitized values within workable ranges (CharucoBoard construction
-// requires markerLength < squareLength, and degenerate small boards have no
-// interior corners to detect).
-BoardSettings Sanitize(BoardSettings s) {
-    s.dictIndex = std::clamp(s.dictIndex, 0, kDictCount - 1);
-    s.cols      = std::clamp(s.cols, 3, 30);
-    s.rows      = std::clamp(s.rows, 3, 30);
-    s.squarePx  = std::clamp(s.squarePx, 20, 4000);
-    s.markerPx  = std::clamp(s.markerPx, 10, s.squarePx - 1);
-    return s;
-}
-
-std::string ExtLower(const std::string& path) {
-    const auto pos = path.find_last_of('.');
-    if (pos == std::string::npos) return "";
-    std::string e = path.substr(pos + 1);
-    std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return std::tolower(c); });
-    return e;
-}
-
-bool IsImageExt(const std::string& e) { return e == "jpg" || e == "jpeg" || e == "png" || e == "bmp"; }
-
-// Parses a show_charuco_4k.py-style meta.txt (key=value lines: cols, rows,
-// dict, square_px, marker_px, plus screen_w/screen_h/margin which this app
-// has no use for). Starts from the board's current settings and only
-// overwrites keys actually present, so a partial/hand-edited file degrades
-// gracefully instead of zeroing everything else out.
-bool LoadBoardMetaTxt(const std::string& path, BoardSettings& out) {
-    std::ifstream f(path);
-    if (!f) {
-        std::fprintf(stderr, "calib_app: failed to open '%s'\n", path.c_str());
-        return false;
-    }
-    BoardSettings s = out;
-    bool any = false;
-    std::string line;
-    while (std::getline(f, line)) {
-        const auto eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        const std::string key = line.substr(0, eq);
-        const std::string val = line.substr(eq + 1);
-        try {
-            if (key == "cols") { s.cols = std::stoi(val); any = true; }
-            else if (key == "rows") { s.rows = std::stoi(val); any = true; }
-            else if (key == "square_px") { s.squarePx = std::stoi(val); any = true; }
-            else if (key == "marker_px") { s.markerPx = std::stoi(val); any = true; }
-            else if (key == "dict") {
-                int idx = -1;
-                for (int i = 0; i < kDictCount; ++i)
-                    if (val == kDictNames[i]) idx = i;
-                if (idx >= 0) { s.dictIndex = idx; any = true; }
-                else std::fprintf(stderr, "calib_app: WARNING '%s' dict='%s' not recognized, keeping current\n",
-                                   path.c_str(), val.c_str());
-            }
-        } catch (const std::exception&) {
-            std::fprintf(stderr, "calib_app: '%s' has a malformed '%s' value\n", path.c_str(), key.c_str());
-        }
-    }
-    if (!any) {
-        std::fprintf(stderr, "calib_app: '%s' had none of cols/rows/dict/square_px/marker_px\n", path.c_str());
-        return false;
-    }
-    out = Sanitize(s);
-    return true;
-}
-
-struct BoardState {
-    cv::Ptr<cv::aruco::Dictionary> dict;
-    cv::Ptr<cv::aruco::CharucoBoard> board;
-    int totalCorners = 0; // interior chessboard corners == (cols-1)*(rows-1)
-};
-
-BoardState BuildBoard(const BoardSettings& s) {
-    BoardState b;
-#if INSTA360_CALIB_NEW_ARUCO_API
-    b.dict = cv::makePtr<cv::aruco::Dictionary>(cv::aruco::getPredefinedDictionary(kDictEnums[s.dictIndex]));
-    b.board = cv::makePtr<cv::aruco::CharucoBoard>(cv::Size(s.cols, s.rows), (float)s.squarePx,
-                                                    (float)s.markerPx, *b.dict);
-#else
-    b.dict = cv::aruco::getPredefinedDictionary(kDictEnums[s.dictIndex]);
-    b.board = cv::aruco::CharucoBoard::create(s.cols, s.rows, (float)s.squarePx, (float)s.markerPx, b.dict);
-#endif
-    b.totalCorners = (s.cols - 1) * (s.rows - 1);
-    return b;
-}
-
-struct Detection {
-    std::vector<int> markerIds;
-    std::vector<std::vector<cv::Point2f>> markerCorners;
-    cv::Mat charucoCorners; // Nx1 CV_32FC2, empty if none found
-    cv::Mat charucoIds;     // Nx1 CV_32SC1
-};
-
-Detection DetectCharuco(const cv::Mat& bgr, const BoardState& b) {
-    Detection d;
-#if INSTA360_CALIB_NEW_ARUCO_API
-    cv::aruco::DetectorParameters params;
-    params.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
-    // Fisheye-distorted squares curve a lot near the image edge; widen the
-    // adaptive-threshold window range so markers there still binarize cleanly.
-    params.adaptiveThreshWinSizeMin = 5;
-    params.adaptiveThreshWinSizeMax = 35;
-    params.adaptiveThreshWinSizeStep = 5;
-
-    cv::aruco::ArucoDetector detector(*b.dict, params);
-    std::vector<std::vector<cv::Point2f>> rejected;
-    detector.detectMarkers(bgr, d.markerCorners, d.markerIds, rejected);
-
-    if (!d.markerIds.empty()) {
-        cv::aruco::CharucoDetector charucoDetector(*b.board);
-        charucoDetector.detectBoard(bgr, d.charucoCorners, d.charucoIds, d.markerCorners, d.markerIds);
-    }
-#else
-    auto params = cv::aruco::DetectorParameters::create();
-    params->cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
-    // Fisheye-distorted squares curve a lot near the image edge; widen the
-    // adaptive-threshold window range so markers there still binarize cleanly.
-    params->adaptiveThreshWinSizeMin = 5;
-    params->adaptiveThreshWinSizeMax = 35;
-    params->adaptiveThreshWinSizeStep = 5;
-
-    std::vector<std::vector<cv::Point2f>> rejected;
-    cv::aruco::detectMarkers(bgr, b.dict, d.markerCorners, d.markerIds, params, rejected);
-
-    if (!d.markerIds.empty()) {
-        cv::aruco::interpolateCornersCharuco(d.markerCorners, d.markerIds, bgr, b.board,
-                                              d.charucoCorners, d.charucoIds);
-    }
-#endif
-    return d;
-}
+namespace fs = std::filesystem;
 
 // Uploads a BGR cv::Mat to the GPU as a raylib Texture2D. Must be called
 // after InitWindow() (needs a GL context). The conversion buffer only needs
@@ -222,6 +78,8 @@ struct View {
     }
 };
 
+bool Finite(cv::Point2f p) { return std::isfinite(p.x) && std::isfinite(p.y); }
+
 // Green under 1px, yellow up to 3px, red beyond — thresholds chosen so a
 // well-calibrated rig (sub-pixel to ~1px, as validated against this rig's
 // sample capture) reads as green.
@@ -231,160 +89,403 @@ Color ErrorColor(double errorPx) {
     return RED;
 }
 
-// Transient banner reporting the outcome of the last drag-and-drop.
-struct DropStatus {
+ImVec4 ToImVec4(Color c) { return ImVec4(c.r / 255.f, c.g / 255.f, c.b / 255.f, 1.f); }
+
+const ImVec4 kWarnColor(1.f, 0.65f, 0.2f, 1.f);
+const ImVec4 kBadColor(1.f, 0.4f, 0.4f, 1.f);
+const ImVec4 kGoodColor(0.3f, 1.f, 0.3f, 1.f);
+const ImVec4 kPartialColor(1.f, 0.85f, 0.2f, 1.f);
+
+std::string FileName(const std::string& path) { return fs::path(path).filename().string(); }
+
+// Transient banner reporting the outcome of the last load/save/calibration.
+struct StatusBanner {
     std::string text;
     double expiresAt = -1.0;
     Color color = RAYWHITE;
 };
 
-} // namespace
+struct App {
+    // ── images ──
+    std::vector<ImageEntry> images;
+    int current = -1;       // index into images, -1 if none
+    cv::Mat currentBgr;     // decoded pixels of images[current]; empty if it failed to load
+    Texture2D tex{};        // left zero-valued (id=0, "no texture") until an image loads
+    bool texLoaded = false;
+    View view;
+    bool detectAllRunning = false;
+    bool scrollListToCurrent = false;
 
-int main(int argc, char** argv) {
-    std::string imagePath = (argc > 1) ? argv[1] : "";
-    std::string cameraInfoPath = (argc > 2) ? argv[2] : "";
+    // ── camera ──
+    CameraIntrinsics cam;       // the active camera everything is verified against
+    std::string cameraInfoPath; // last camera_info.yaml loaded (also the save template)
+    CameraIntrinsics loadedCam; // what cameraInfoPath held, to revert to
+    bool camIsCalibration = false;
 
-    cv::Mat bgr;
-    bool imageLoaded = false;
-    if (imagePath.empty()) {
-        std::printf("calib_app: no image given — drop one onto the window, or pass a path as the first argument\n");
-    } else {
-        bgr = cv::imread(imagePath, cv::IMREAD_COLOR);
-        if (bgr.empty()) {
-            std::fprintf(stderr, "calib_app: failed to load image '%s', starting without one\n", imagePath.c_str());
-            imagePath.clear();
-        } else {
-            imageLoaded = true;
-            std::printf("calib_app: loaded %s (%dx%d)\n", imagePath.c_str(), bgr.cols, bgr.rows);
-        }
-    }
-
-    MeiCamera cam;
-    if (cameraInfoPath.empty())
-        std::printf("calib_app: no camera_info.yaml given — drop one onto the window, or pass a path as the second argument\n");
-    else
-        cam = LoadMeiCamera(cameraInfoPath);
-
-    BoardSettings appliedSettings; // last settings actually used to detect
+    // ── board ──
+    BoardSettings appliedSettings;                // last settings actually used to detect
     BoardSettings editSettings = appliedSettings; // live UI edit buffer
     BoardState boardState = BuildBoard(appliedSettings);
 
-    Detection det;
-    VerificationResult verify;
-    auto runDetectAndVerify = [&]() {
-        if (!imageLoaded) {
-            det = Detection{};
-            verify = VerificationResult{};
-            verify.message = "no image loaded";
-            return;
-        }
-        det = DetectCharuco(bgr, boardState);
-        verify = VerifyPose(det.charucoCorners, det.charucoIds, boardState.board, cam);
-        std::printf("calib_app: detected %zu markers, %d/%d charuco corners", det.markerIds.size(),
-                    det.charucoCorners.empty() ? 0 : det.charucoCorners.rows, boardState.totalCorners);
-        if (verify.ok)
-            std::printf(" | reprojection mean=%.2f rms=%.2f max=%.2f px\n", verify.meanErrorPx,
-                        verify.rmsErrorPx, verify.maxErrorPx);
-        else
-            std::printf(" | no reprojection (%s)\n", verify.message.c_str());
-    };
-    runDetectAndVerify();
+    // ── calibration ──
+    CameraModel calibModel = CameraModel::Mei; // model the next calibration fits
+    CalibrationOptions calibOptions = DefaultCalibrationOptions(calibModel);
+    bool calibFromGeneric = false;
+    bool haveCalib = false;
+    CalibrationResult calib;
+    CameraIntrinsics calibInitial;
+    CalibrationOptions calibRunOptions; // what `calib` was actually run with
+    std::string calibTemplatePath; // camera_info.yaml whose other fields a save keeps, "" if none
+    std::string calibStartLabel;   // what the calibration started from, for display
+    char savePath[1024] = "";
+    bool overwriteArmed = false;
 
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
-    InitWindow(1280, 960, "calib_app - charuco detection");
-    SetTargetFPS(60);
-    rlImGuiSetup(true);
-
-    Texture2D tex{}; // left zero-valued (id=0, "no texture") until an image loads
-    View view;
-    if (imageLoaded) {
-        tex = MatToTexture(bgr);
-        view.ResetToFit(tex.width, tex.height, GetScreenWidth(), GetScreenHeight());
-    }
-
+    // ── display ──
     bool showMarkers     = true;
     bool showCharuco     = true;
     bool showReprojected = true;
     bool showHelp        = true;
     float markerScale    = 1.0f; // uniform size multiplier for all overlay markers
+    StatusBanner banner;
 
-    DropStatus dropStatus;
-    auto setDropStatus = [&](const std::string& text, Color color) {
-        dropStatus = {text, GetTime() + 4.0, color};
+    void SetBanner(const std::string& text, Color color) {
+        banner = {text, GetTime() + 5.0, color};
         std::printf("calib_app: %s\n", text.c_str());
-    };
+    }
 
-    while (!WindowShouldClose()) {
-        BeginDrawing();
-        ClearBackground(DARKGRAY);
+    ImageEntry* Current() { return current >= 0 ? &images[current] : nullptr; }
 
-        rlImGuiBegin();
-        const ImGuiIO& io = ImGui::GetIO();
-        const bool blockMouse    = io.WantCaptureMouse;
-        const bool blockKeyboard = io.WantCaptureKeyboard;
+    // ── loading ───────────────────────────────────────────────────────────
 
-        // ── drag & drop: image / camera_info.yaml / charuco meta.txt ───────
-        if (IsFileDropped()) {
-            FilePathList files = LoadDroppedFiles();
-            bool needBoardRebuild = false;
-            bool needRedetect = false;
-            for (unsigned int i = 0; i < files.count; ++i) {
-                const std::string path = files.paths[i];
-                const std::string name = GetFileName(path.c_str());
+    // Loads every path given on the command line or dropped on the window:
+    // images (and folders of them) are appended to the set, a .yaml becomes
+    // the active camera, a .txt the board layout.
+    void LoadPaths(const std::vector<std::string>& inputs) {
+        // One banner for the whole batch, colored by its worst outcome.
+        enum Severity { kOk, kWarning, kError };
+        std::vector<std::string> notes;
+        Severity worst = kOk;
+        auto note = [&](const std::string& text, Severity sev) {
+            notes.push_back(text);
+            worst = std::max(worst, sev);
+        };
+
+        int added = 0, alreadyLoaded = 0, firstNew = -1;
+        bool boardChanged = false, camChanged = false;
+        for (const std::string& input : inputs) {
+            const std::vector<std::string> files = ExpandInputPath(input);
+            if (files.empty()) note("nothing loadable in folder '" + FileName(input) + "'", kWarning);
+            for (const std::string& path : files) {
+                const std::string name = FileName(path);
                 const std::string ext = ExtLower(path);
-
                 if (IsImageExt(ext)) {
-                    cv::Mat newBgr = cv::imread(path, cv::IMREAD_COLOR);
-                    if (newBgr.empty()) {
-                        setDropStatus("failed to load image '" + name + "'", RED);
-                    } else {
-                        bgr = newBgr;
-                        imagePath = path;
-                        if (imageLoaded) UnloadTexture(tex);
-                        tex = MatToTexture(bgr);
-                        imageLoaded = true;
-                        view.ResetToFit(tex.width, tex.height, GetScreenWidth(), GetScreenHeight());
-                        needRedetect = true;
-                        setDropStatus("loaded image '" + name + "'", LIME);
+                    auto it = std::find_if(images.begin(), images.end(),
+                                           [&](const ImageEntry& e) { return e.path == path; });
+                    if (it != images.end()) {
+                        ++alreadyLoaded;
+                        if (firstNew < 0) firstNew = (int)(it - images.begin());
+                        continue;
                     }
+                    ImageEntry e;
+                    e.path = path;
+                    images.push_back(std::move(e));
+                    if (firstNew < 0) firstNew = (int)images.size() - 1;
+                    ++added;
                 } else if (ext == "yaml" || ext == "yml") {
-                    MeiCamera newCam = LoadMeiCamera(path);
+                    CameraIntrinsics newCam = LoadCamera(path);
                     if (newCam.loaded) {
-                        cam = newCam;
+                        cam = loadedCam = newCam;
                         cameraInfoPath = path;
-                        needRedetect = true;
-                        setDropStatus("loaded camera intrinsics '" + name + "'", LIME);
+                        camIsCalibration = false;
+                        camChanged = true;
+                        SetCalibrationModel(cam.model);
+                        note("loaded " + std::string(cam.Info().name) + " intrinsics '" + name + "'", kOk);
                     } else {
-                        setDropStatus("failed to load camera info '" + name + "'", RED);
+                        note("failed to load camera info '" + name + "'", kError);
                     }
                 } else if (ext == "txt") {
                     if (LoadBoardMetaTxt(path, editSettings)) {
                         appliedSettings = editSettings;
-                        needBoardRebuild = true;
-                        needRedetect = true;
-                        setDropStatus("loaded board layout '" + name + "'", LIME);
+                        boardChanged = true;
+                        note("loaded board layout '" + name + "'", kOk);
                     } else {
-                        setDropStatus("failed to load board layout '" + name + "'", RED);
+                        note("failed to load board layout '" + name + "'", kError);
                     }
                 } else {
-                    setDropStatus("unrecognized file '" + name + "' (expected image/.yaml/.txt)", ORANGE);
+                    note("unrecognized file '" + name + "' (expected image/folder/.yaml/.txt)", kWarning);
                 }
             }
-            if (needBoardRebuild) boardState = BuildBoard(appliedSettings);
-            if (needRedetect) runDetectAndVerify();
-            UnloadDroppedFiles(files);
+        }
+        if (added == 1 && alreadyLoaded == 0) note("added image '" + FileName(images.back().path) + "'", kOk);
+        else if (added > 0) note("added " + std::to_string(added) + " images", kOk);
+        if (alreadyLoaded > 0) note(std::to_string(alreadyLoaded) + " already loaded", kOk);
+
+        if (boardChanged) {
+            boardState = BuildBoard(appliedSettings);
+            InvalidateDetections();
+        } else if (camChanged) {
+            ReverifyAll();
+        }
+        if (firstNew >= 0) Select(firstNew);
+
+        if (!notes.empty()) {
+            std::string text = notes[0];
+            for (size_t i = 1; i < notes.size(); ++i) text += "  |  " + notes[i];
+            SetBanner(text, worst == kError ? RED : worst == kWarning ? ORANGE : LIME);
+        }
+    }
+
+    // Makes images[idx] the displayed image, decoding it (and detecting the
+    // board in it, if that hasn't happened for the current board yet).
+    void Select(int idx) {
+        const int prevW = texLoaded ? tex.width : -1, prevH = texLoaded ? tex.height : -1;
+        if (texLoaded) UnloadTexture(tex);
+        texLoaded = false;
+        currentBgr.release();
+        if (images.empty()) {
+            current = -1;
+            return;
+        }
+        current = std::clamp(idx, 0, (int)images.size() - 1);
+        scrollListToCurrent = true;
+
+        ImageEntry& e = images[current];
+        currentBgr = cv::imread(e.path, cv::IMREAD_COLOR);
+        if (currentBgr.empty()) {
+            e.loadFailed = true;
+            SetBanner("failed to load image '" + FileName(e.path) + "'", RED);
+            return;
+        }
+        e.loadFailed = false;
+        tex = MatToTexture(currentBgr);
+        texLoaded = true;
+        // Same-size images keep the zoom/pan, so the same region can be
+        // compared while stepping through a capture.
+        if (tex.width != prevW || tex.height != prevH)
+            view.ResetToFit(tex.width, tex.height, GetScreenWidth(), GetScreenHeight());
+        if (!e.detected) Process(e, currentBgr);
+    }
+
+    void Step(int delta) {
+        if (!images.empty()) Select(std::clamp(current + delta, 0, (int)images.size() - 1));
+    }
+
+    void Remove(int idx) {
+        if (idx < 0 || idx >= (int)images.size()) return;
+        images.erase(images.begin() + idx);
+        if (idx < current) --current;
+        else if (idx == current) Select(std::min(idx, (int)images.size() - 1));
+    }
+
+    void Clear() {
+        images.clear();
+        detectAllRunning = false;
+        Select(-1);
+    }
+
+    // ── detection / verification ──────────────────────────────────────────
+
+    void Process(ImageEntry& e, const cv::Mat& bgr) {
+        e.width = bgr.cols;
+        e.height = bgr.rows;
+        e.det = DetectCharuco(bgr, boardState);
+        e.verify = VerifyPose(e.det.charucoCorners, e.det.charucoIds, boardState.board, cam);
+        e.detected = true;
+        std::printf("calib_app: %s: %zu markers, %d/%d charuco corners", FileName(e.path).c_str(),
+                    e.det.markerIds.size(), e.det.CornerCount(), boardState.totalCorners);
+        if (e.verify.ok)
+            std::printf(" | reprojection mean=%.2f rms=%.2f max=%.2f px\n", e.verify.meanErrorPx,
+                        e.verify.rmsErrorPx, e.verify.maxErrorPx);
+        else
+            std::printf(" | no reprojection (%s)\n", e.verify.message.c_str());
+    }
+
+    // Board changed: every cached detection is stale. The displayed image is
+    // re-detected straight away; the rest wait for a visit or "Detect all".
+    void InvalidateDetections() {
+        for (ImageEntry& e : images) {
+            e.detected = false;
+            e.det = Detection{};
+            e.verify = VerificationResult{};
+        }
+        if (ImageEntry* e = Current(); e && !currentBgr.empty()) Process(*e, currentBgr);
+    }
+
+    // Camera changed: detections still hold, only the poses/reprojections
+    // need redoing — cheap enough to do for every image at once.
+    void ReverifyAll() {
+        for (ImageEntry& e : images)
+            if (e.detected) e.verify = VerifyPose(e.det.charucoCorners, e.det.charucoIds, boardState.board, cam);
+    }
+
+    int DetectedCount() const {
+        return (int)std::count_if(images.begin(), images.end(),
+                                  [](const ImageEntry& e) { return e.detected || e.loadFailed; });
+    }
+
+    // One image per frame, so the window stays responsive while a whole
+    // capture folder is worked through.
+    void DetectAllStep() {
+        if (!detectAllRunning) return;
+        for (int i = 0; i < (int)images.size(); ++i) {
+            ImageEntry& e = images[i];
+            if (e.detected || e.loadFailed) continue;
+            if (i == current && !currentBgr.empty()) {
+                Process(e, currentBgr);
+                return;
+            }
+            const cv::Mat bgr = cv::imread(e.path, cv::IMREAD_COLOR);
+            if (bgr.empty()) e.loadFailed = true;
+            else Process(e, bgr);
+            return;
+        }
+        detectAllRunning = false;
+        SetBanner("detection finished: " + std::to_string(CalibrationCandidates().size()) + " of " +
+                      std::to_string(images.size()) + " images usable for calibration",
+                  LIME);
+    }
+
+    // ── calibration ───────────────────────────────────────────────────────
+
+    // Switching models resets which parameters are held: the indices mean
+    // different things per model.
+    void SetCalibrationModel(CameraModel model) {
+        if (model == calibModel) return;
+        calibModel = model;
+        calibOptions = DefaultCalibrationOptions(model);
+    }
+
+    std::vector<int> CalibrationCandidates() const {
+        std::vector<int> idx;
+        for (int i = 0; i < (int)images.size(); ++i) {
+            const ImageEntry& e = images[i];
+            if (e.detected && !e.loadFailed && e.useForCalibration && e.det.CornerCount() >= kMinVerifyCorners)
+                idx.push_back(i);
+        }
+        return idx;
+    }
+
+    void RunCalibration() {
+        const std::vector<int> idx = CalibrationCandidates();
+        if ((int)idx.size() < kMinCalibrationViews) {
+            SetBanner("calibration needs >= " + std::to_string(kMinCalibrationViews) +
+                          " usable images, have " + std::to_string(idx.size()),
+                      ORANGE);
+            return;
+        }
+        const int w = images[idx[0]].width, h = images[idx[0]].height;
+        for (int i : idx) {
+            if (images[i].width != w || images[i].height != h) {
+                SetBanner("images differ in size (" + FileName(images[i].path) + ") — calibrate one camera at a time",
+                          RED);
+                return;
+            }
         }
 
-        // ── input ────────────────────────────────────────────────────────
+        const std::vector<cv::Point3f> corners = BoardCorners(*boardState.board);
+        std::vector<BoardView> views;
+        views.reserve(idx.size());
+        for (int i : idx) {
+            const Detection& d = images[i].det;
+            BoardView v;
+            for (int k = 0; k < d.CornerCount(); ++k) {
+                v.objectPoints.push_back(corners[d.charucoIds.at<int>(k)]);
+                v.imagePoints.push_back(d.charucoCorners.at<cv::Point2f>(k));
+            }
+            views.push_back(std::move(v));
+        }
+
+        const bool sizeMatches = cam.loaded && cam.width == w && cam.height == h;
+        const bool modelMatches = cam.loaded && cam.model == calibModel;
+        if (modelMatches && !sizeMatches && !calibFromGeneric)
+            SetBanner("camera_info.yaml is " + std::to_string(cam.width) + "x" + std::to_string(cam.height) +
+                          " but the images are " + std::to_string(w) + "x" + std::to_string(h) +
+                          " — starting from a generic guess",
+                      ORANGE);
+        const bool fromCamera = sizeMatches && modelMatches && !calibFromGeneric;
+        calibInitial = fromCamera ? cam : GenericGuess(calibModel, w, h, views);
+        if (!fromCamera && cam.loaded) calibInitial.frameId = cam.frameId;
+        // A save keeps the loaded camera_info.yaml's other fields whenever the
+        // images match it, even when the fit itself started elsewhere (or is
+        // of another model).
+        calibTemplatePath = sizeMatches ? cameraInfoPath : "";
+        calibStartLabel = !fromCamera        ? "a generic guess"
+                          : camIsCalibration ? "the previous calibration"
+                                             : FileName(cameraInfoPath);
+
+        calibRunOptions = calibOptions;
+        calib = Calibrate(views, calibInitial, calibRunOptions);
+        haveCalib = true;
+        overwriteArmed = false;
+        if (!calib.ok) {
+            SetBanner("calibration failed: " + calib.message, RED);
+            return;
+        }
+        if (savePath[0] == '\0') {
+            const std::string dir = fs::path(calibTemplatePath.empty() ? images[idx[0]].path : calibTemplatePath)
+                                        .parent_path()
+                                        .string();
+            const std::string defaultPath = (fs::path(dir) / "camera_info_calibrated.yaml").string();
+            std::snprintf(savePath, sizeof(savePath), "%s", defaultPath.c_str());
+        }
+        std::printf("calib_app: calibration: %s\n", calib.message.c_str());
+        for (int k = 0; k < calib.camera.NumParams(); ++k)
+            std::printf("calib_app:   %-2s = %.8g +- %.3g\n", calib.camera.Info().paramNames[k],
+                        calib.camera.params[k], calib.stdDev[k]);
+        SetBanner("calibrated: " + calib.message, LIME);
+    }
+
+    void ApplyCalibration() {
+        cam = calib.camera;
+        camIsCalibration = true;
+        ReverifyAll();
+        SetBanner("verifying against the calibration result", LIME);
+    }
+
+    void RevertCamera() {
+        cam = loadedCam;
+        camIsCalibration = false;
+        ReverifyAll();
+        SetBanner("verifying against '" + FileName(cameraInfoPath) + "' again", LIME);
+    }
+
+    void SaveCalibration() {
+        const std::string path = savePath;
+        std::error_code ec;
+        if (fs::exists(path, ec) && !overwriteArmed) {
+            overwriteArmed = true;
+            SetBanner("'" + FileName(path) + "' exists — press Save again to overwrite it", ORANGE);
+            return;
+        }
+        overwriteArmed = false;
+
+        std::string comment = "intrinsics re-estimated from " + calib.message;
+        std::string fixed;
+        for (int k = 0; k < calib.camera.NumParams(); ++k)
+            if (calibRunOptions.fixed[k]) fixed += std::string(" ") + calib.camera.Info().paramNames[k];
+        if (!fixed.empty()) comment += "; fixed:" + fixed;
+        comment += "; started from " + calibStartLabel;
+        std::string error;
+        if (SaveCamera(path, calib.camera, calibTemplatePath, comment, &error))
+            SetBanner("saved '" + path + "'", LIME);
+        else
+            SetBanner("save failed: " + error, RED);
+    }
+
+    // ── per-frame UI ──────────────────────────────────────────────────────
+
+    void HandleInput(bool blockMouse, bool blockKeyboard) {
         if (!blockKeyboard) {
             if (IsKeyPressed(KEY_M)) showMarkers = !showMarkers;
             if (IsKeyPressed(KEY_C)) showCharuco = !showCharuco;
             if (IsKeyPressed(KEY_P)) showReprojected = !showReprojected;
             if (IsKeyPressed(KEY_H)) showHelp = !showHelp;
-            if (IsKeyPressed(KEY_R) && imageLoaded)
+            if (IsKeyPressed(KEY_R) && texLoaded)
                 view.ResetToFit(tex.width, tex.height, GetScreenWidth(), GetScreenHeight());
+            if (IsKeyPressed(KEY_RIGHT) || IsKeyPressedRepeat(KEY_RIGHT)) Step(1);
+            if (IsKeyPressed(KEY_LEFT) || IsKeyPressedRepeat(KEY_LEFT)) Step(-1);
         }
-        if (IsWindowResized() && imageLoaded)
+        if (IsWindowResized() && texLoaded)
             view.ResetToFit(tex.width, tex.height, GetScreenWidth(), GetScreenHeight());
 
         if (!blockMouse) {
@@ -404,23 +505,32 @@ int main(int argc, char** argv) {
                 view.offset.y += d.y;
             }
         }
+    }
 
-        // ── image + overlays ─────────────────────────────────────────────
-        if (!imageLoaded) {
-            const char* msg = "Drop a fisheye image onto this window to begin";
-            const char* msg2 = "(or pass a path as the first CLI argument)";
+    void DrawImageAndOverlays() {
+        const ImageEntry* e = Current();
+        if (!e) {
+            const char* msg = "Drop fisheye images or a capture folder onto this window to begin";
+            const char* msg2 = "(or pass paths on the command line)";
             const int fs = 22, fs2 = 15;
             DrawText(msg, (GetScreenWidth() - MeasureText(msg, fs)) / 2, GetScreenHeight() / 2 - 20, fs,
-                      Fade(RAYWHITE, 0.85f));
+                     Fade(RAYWHITE, 0.85f));
             DrawText(msg2, (GetScreenWidth() - MeasureText(msg2, fs2)) / 2, GetScreenHeight() / 2 + 10, fs2,
-                      Fade(RAYWHITE, 0.55f));
+                     Fade(RAYWHITE, 0.55f));
+            return;
+        }
+        if (!texLoaded) {
+            const std::string msg = "failed to load " + FileName(e->path);
+            DrawText(msg.c_str(), (GetScreenWidth() - MeasureText(msg.c_str(), 20)) / 2, GetScreenHeight() / 2, 20,
+                     RED);
+            return;
         }
 
-        if (imageLoaded)
-            DrawTexturePro(tex, {0, 0, (float)tex.width, (float)tex.height},
-                           {view.offset.x, view.offset.y, tex.width * view.scale, tex.height * view.scale},
-                           {0, 0}, 0.f, WHITE);
+        DrawTexturePro(tex, {0, 0, (float)tex.width, (float)tex.height},
+                       {view.offset.x, view.offset.y, tex.width * view.scale, tex.height * view.scale}, {0, 0}, 0.f,
+                       WHITE);
 
+        const Detection& det = e->det;
         if (showMarkers) {
             for (size_t i = 0; i < det.markerCorners.size(); ++i) {
                 const auto& c = det.markerCorners[i];
@@ -432,75 +542,73 @@ int main(int argc, char** argv) {
                 Vector2 label = view.ToScreen(c[0]);
                 const int labelFs = std::max(1, (int)std::lround(14.f * markerScale));
                 DrawText(TextFormat("%d", det.markerIds[i]), (int)label.x + (int)std::lround(4.f * markerScale),
-                          (int)label.y - labelFs, labelFs, YELLOW);
+                         (int)label.y - labelFs, labelFs, YELLOW);
             }
         }
 
-        const int nCharuco = det.charucoCorners.empty() ? 0 : det.charucoCorners.rows;
-        if (showCharuco && nCharuco > 0) {
-            for (int i = 0; i < nCharuco; ++i) {
-                cv::Point2f p = det.charucoCorners.at<cv::Point2f>(i);
-                Vector2 s = view.ToScreen(p);
-                DrawCircleV(s, 4.f * markerScale, GREEN);
-            }
+        if (showCharuco) {
+            for (int i = 0; i < det.CornerCount(); ++i)
+                DrawCircleV(view.ToScreen(det.charucoCorners.at<cv::Point2f>(i)), 4.f * markerScale, GREEN);
         }
 
-        if (showReprojected && verify.ok) {
+        if (showReprojected && e->verify.ok) {
             // The whole predicted board grid, including corners that weren't
             // detected, so a systematic mismatch (wrong intrinsics, wrong
             // board settings) is visible even where detection failed.
             const float crossHalf = 5.f * markerScale;
-            for (const cv::Point2f& p : verify.allReprojected) {
+            for (const cv::Point2f& p : e->verify.allReprojected) {
+                if (!Finite(p)) continue;
                 Vector2 s = view.ToScreen(p);
                 DrawLineEx({s.x - crossHalf, s.y}, {s.x + crossHalf, s.y}, 1.5f * markerScale, SKYBLUE);
                 DrawLineEx({s.x, s.y - crossHalf}, {s.x, s.y + crossHalf}, 1.5f * markerScale, SKYBLUE);
             }
             // Detected <-> reprojected residual, colored by error magnitude.
-            for (const CornerResidual& res : verify.residuals) {
-                Vector2 a = view.ToScreen(res.detected);
-                Vector2 b = view.ToScreen(res.reprojected);
-                DrawLineEx(a, b, 2.f * markerScale, ErrorColor(res.errorPx));
+            for (const CornerResidual& res : e->verify.residuals) {
+                if (!Finite(res.reprojected)) continue;
+                DrawLineEx(view.ToScreen(res.detected), view.ToScreen(res.reprojected), 2.f * markerScale,
+                           ErrorColor(res.errorPx));
             }
         }
+    }
 
-        // ── HUD ──────────────────────────────────────────────────────────
+    void DrawHud() {
         DrawRectangle(0, 0, GetScreenWidth(), 26, Fade(BLACK, 0.6f));
-        if (imageLoaded)
-            DrawText(TextFormat("%s  |  %d markers  |  %d/%d charuco corners  |  zoom %.0f%%",
-                                 GetFileName(imagePath.c_str()), (int)det.markerIds.size(),
-                                 nCharuco, boardState.totalCorners, view.scale * 100.f),
-                      8, 6, 14, RAYWHITE);
+        if (const ImageEntry* e = Current())
+            DrawText(TextFormat("[%d/%d] %s  |  %d markers  |  %d/%d charuco corners  |  zoom %.0f%%", current + 1,
+                                (int)images.size(), FileName(e->path).c_str(), (int)e->det.markerIds.size(),
+                                e->det.CornerCount(), boardState.totalCorners, view.scale * 100.f),
+                     8, 6, 14, RAYWHITE);
         else
             DrawText("no image loaded", 8, 6, 14, RAYWHITE);
 
         if (showHelp) {
-            const int x = 8, y = GetScreenHeight() - 132;
-            DrawRectangle(x - 6, y - 6, 340, 126, Fade(BLACK, 0.6f));
+            const int x = 8, y = GetScreenHeight() - 150;
+            DrawRectangle(x - 6, y - 6, 360, 144, Fade(BLACK, 0.6f));
             DrawText("[M] markers  [C] charuco corners", x, y, 14, RAYWHITE);
             DrawText("[P] reprojection  [R] reset view", x, y + 18, 14, RAYWHITE);
-            DrawText("[H] hide this help", x, y + 36, 14, RAYWHITE);
-            DrawText("scroll: zoom (at cursor)  drag: pan", x, y + 54, 14, RAYWHITE);
-            DrawText("drop image / camera_info.yaml / meta.txt", x, y + 72, 14, RAYWHITE);
-            if (imageLoaded)
-                DrawText(nCharuco == boardState.totalCorners ? "full board detected" : "partial board",
-                         x, y + 96, 14, nCharuco == boardState.totalCorners ? GREEN : YELLOW);
+            DrawText("[<-] [->] previous / next image", x, y + 36, 14, RAYWHITE);
+            DrawText("[H] hide this help", x, y + 54, 14, RAYWHITE);
+            DrawText("scroll: zoom (at cursor)  drag: pan", x, y + 72, 14, RAYWHITE);
+            DrawText("drop images / folder / camera_info.yaml / meta.txt", x, y + 90, 14, RAYWHITE);
+            if (const ImageEntry* e = Current(); e && texLoaded) {
+                const bool full = e->det.CornerCount() == boardState.totalCorners;
+                DrawText(full ? "full board detected" : "partial board", x, y + 114, 14, full ? GREEN : YELLOW);
+            }
         }
 
-        if (GetTime() < dropStatus.expiresAt) {
-            const int w = MeasureText(dropStatus.text.c_str(), 16) + 20;
+        if (GetTime() < banner.expiresAt) {
+            const int w = MeasureText(banner.text.c_str(), 16) + 20;
             const int x = (GetScreenWidth() - w) / 2, y = 34;
             DrawRectangle(x, y, w, 26, Fade(BLACK, 0.75f));
-            DrawRectangleLines(x, y, w, 26, dropStatus.color);
-            DrawText(dropStatus.text.c_str(), x + 10, y + 5, 16, dropStatus.color);
+            DrawRectangleLines(x, y, w, 26, banner.color);
+            DrawText(banner.text.c_str(), x + 10, y + 5, 16, banner.color);
         }
+    }
 
-        // ── board settings panel ─────────────────────────────────────────
+    void BoardPanel() {
         ImGui::SetNextWindowPos(ImVec2(10, 34), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(280, 0), ImGuiCond_FirstUseEver);
         ImGui::Begin("Board settings");
-
-        if (!imageLoaded)
-            ImGui::TextColored(ImVec4(1.f, 0.65f, 0.2f, 1.f), "No image loaded (drop one onto the window)");
 
         ImGui::Combo("Dictionary", &editSettings.dictIndex, kDictNames, kDictCount);
         ImGui::InputInt("Columns", &editSettings.cols);
@@ -511,86 +619,373 @@ int main(int argc, char** argv) {
         const BoardSettings sanitized = Sanitize(editSettings);
         if (sanitized.markerPx != editSettings.markerPx || sanitized.squarePx != editSettings.squarePx ||
             sanitized.cols != editSettings.cols || sanitized.rows != editSettings.rows) {
-            ImGui::TextColored(ImVec4(1.f, 0.65f, 0.2f, 1.f), "Will clamp to %dx%d, square=%d, marker=%d",
-                                sanitized.cols, sanitized.rows, sanitized.squarePx, sanitized.markerPx);
+            ImGui::TextColored(kWarnColor, "Will clamp to %dx%d, square=%d, marker=%d", sanitized.cols,
+                               sanitized.rows, sanitized.squarePx, sanitized.markerPx);
         }
 
         if (ImGui::Button("Detect")) {
             editSettings = sanitized;
             appliedSettings = sanitized;
             boardState = BuildBoard(appliedSettings);
-            runDetectAndVerify();
+            InvalidateDetections();
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Apply these settings; every image's detection is redone");
         ImGui::SameLine();
-        if (ImGui::Button("Reset to default")) {
-            editSettings = BoardSettings{};
-        }
+        if (ImGui::Button("Reset to default")) editSettings = BoardSettings{};
 
         ImGui::Separator();
         ImGui::Text("Applied: %dx%d  %s  sq=%d mk=%d", appliedSettings.cols, appliedSettings.rows,
                     kDictNames[appliedSettings.dictIndex], appliedSettings.squarePx, appliedSettings.markerPx);
-        ImGui::Text("Detected: %zu markers", det.markerIds.size());
-        ImGui::TextColored(nCharuco == boardState.totalCorners ? ImVec4(0.3f, 1.f, 0.3f, 1.f)
-                                                                 : ImVec4(1.f, 0.85f, 0.2f, 1.f),
-                            "%d / %d charuco corners", nCharuco, boardState.totalCorners);
+        if (const ImageEntry* e = Current()) {
+            const int n = e->det.CornerCount();
+            ImGui::Text("This image: %zu markers", e->det.markerIds.size());
+            ImGui::TextColored(n == boardState.totalCorners ? kGoodColor : kPartialColor, "%d / %d charuco corners",
+                               n, boardState.totalCorners);
+        } else {
+            ImGui::TextColored(kWarnColor, "No image loaded (drop one onto the window)");
+        }
 
         ImGui::Separator();
         ImGui::SliderFloat("Overlay marker size", &markerScale, 0.25f, 4.0f, "%.2fx");
-
         ImGui::End();
+    }
 
-        // ── calibration verification panel ────────────────────────────────
-        ImGui::SetNextWindowPos(ImVec2(10, 260), ImGuiCond_FirstUseEver);
+    void VerificationPanel() {
+        ImGui::SetNextWindowPos(ImVec2(10, 280), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(280, 0), ImGuiCond_FirstUseEver);
         ImGui::Begin("Calibration verification");
 
         if (!cam.loaded) {
-            ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "camera_info.yaml not loaded");
-            if (cameraInfoPath.empty())
-                ImGui::TextDisabled("drop a camera_info.yaml onto the window");
-            else
-                ImGui::TextWrapped("%s", cameraInfoPath.c_str());
+            ImGui::TextColored(kBadColor, "camera_info.yaml not loaded");
+            ImGui::TextDisabled("drop a camera_info.yaml onto the window");
         } else {
-            ImGui::Text("%s", cam.distortionModel.c_str());
-            ImGui::Text("fx=%.2f fy=%.2f", cam.fx, cam.fy);
-            ImGui::Text("cx=%.2f cy=%.2f", cam.cx, cam.cy);
-            ImGui::Text("xi=%.4f", cam.xi);
-            ImGui::Text("k1=%.5g k2=%.5g k3=%.5g", cam.k1, cam.k2, cam.k3);
-            ImGui::Text("p1=%.5g p2=%.5g", cam.p1, cam.p2);
-            ImGui::TextDisabled("(distortion order: k1,k2,k3,p1,p2)");
+            if (camIsCalibration) {
+                ImGui::TextColored(kPartialColor, "Active: calibration result");
+                if (loadedCam.loaded) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Revert")) RevertCamera();
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Back to %s", cameraInfoPath.c_str());
+                }
+            } else {
+                ImGui::Text("Active: %s", FileName(cameraInfoPath).c_str());
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", cameraInfoPath.c_str());
+            }
+            const CameraModelInfo& info = cam.Info();
+            ImGui::Text("%s  %dx%d", info.name, cam.width, cam.height);
+            ImGui::Text("fx=%.2f fy=%.2f", cam.params[kFx], cam.params[kFy]);
+            ImGui::Text("cx=%.2f cy=%.2f", cam.params[kCx], cam.params[kCy]);
+            // The model's own terms, three to a line.
+            for (int k = 4; k < info.numParams; ++k) {
+                if ((k - 4) % 3 != 0) ImGui::SameLine();
+                ImGui::Text("%s=%.5g", info.paramNames[k], cam.params[k]);
+            }
+            std::string order;
+            for (int k = info.distortionOffset; k < info.numParams; ++k)
+                order += std::string(k > info.distortionOffset ? "," : "") + info.paramNames[k];
+            ImGui::TextDisabled("(distortion order: %s)", order.c_str());
 
             ImGui::Separator();
             ImGui::Checkbox("Show reprojection overlay", &showReprojected);
 
-            if (!verify.ok) {
-                ImGui::TextColored(ImVec4(1.f, 0.65f, 0.2f, 1.f), "No pose: %s", verify.message.c_str());
+            const ImageEntry* e = Current();
+            if (!e) {
+                ImGui::TextDisabled("no image selected");
+            } else if (!e->verify.ok) {
+                ImGui::TextColored(kWarnColor, "No pose: %s",
+                                   e->detected ? e->verify.message.c_str() : "not detected yet");
             } else {
-                ImGui::Text("Reprojection error (%zu corners):", verify.residuals.size());
-                ImGui::TextColored(ImVec4(ErrorColor(verify.meanErrorPx).r / 255.f,
-                                           ErrorColor(verify.meanErrorPx).g / 255.f,
-                                           ErrorColor(verify.meanErrorPx).b / 255.f, 1.f),
-                                    "mean %.2f px", verify.meanErrorPx);
-                ImGui::TextColored(ImVec4(ErrorColor(verify.rmsErrorPx).r / 255.f,
-                                           ErrorColor(verify.rmsErrorPx).g / 255.f,
-                                           ErrorColor(verify.rmsErrorPx).b / 255.f, 1.f),
-                                    "rms  %.2f px", verify.rmsErrorPx);
-                ImGui::TextColored(ImVec4(ErrorColor(verify.maxErrorPx).r / 255.f,
-                                           ErrorColor(verify.maxErrorPx).g / 255.f,
-                                           ErrorColor(verify.maxErrorPx).b / 255.f, 1.f),
-                                    "max  %.2f px", verify.maxErrorPx);
+                const VerificationResult& v = e->verify;
+                ImGui::Text("Reprojection error (%zu corners):", v.residuals.size());
+                ImGui::TextColored(ToImVec4(ErrorColor(v.meanErrorPx)), "mean %.2f px", v.meanErrorPx);
+                ImGui::TextColored(ToImVec4(ErrorColor(v.rmsErrorPx)), "rms  %.2f px", v.rmsErrorPx);
+                ImGui::TextColored(ToImVec4(ErrorColor(v.maxErrorPx)), "max  %.2f px", v.maxErrorPx);
                 ImGui::TextDisabled("blue crosshair = predicted corner");
                 ImGui::TextDisabled("green/yellow/red = detected->predicted");
             }
         }
-
         ImGui::End();
+    }
+
+    void ImagesPanel() {
+        ImGui::SetNextWindowPos(ImVec2((float)GetScreenWidth() - 390, 34), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(380, 420), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Images");
+
+        const int n = (int)images.size();
+        const int done = DetectedCount();
+        if (detectAllRunning) {
+            ImGui::ProgressBar(n ? (float)done / n : 1.f, ImVec2(-80, 0),
+                               TextFormat("detecting %d/%d", done, n));
+            ImGui::SameLine();
+            if (ImGui::Button("Stop", ImVec2(-1, 0))) detectAllRunning = false;
+        } else {
+            ImGui::BeginDisabled(done == n);
+            if (ImGui::Button("Detect all")) detectAllRunning = true;
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::Text("%d image(s), %d detected", n, done);
+        }
+
+        ImGui::BeginDisabled(current <= 0);
+        if (ImGui::ArrowButton("##prev", ImGuiDir_Left)) Step(-1);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(current < 0 || current >= n - 1);
+        if (ImGui::ArrowButton("##next", ImGuiDir_Right)) Step(1);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(current < 0);
+        const bool removeCurrent = ImGui::Button("Remove");
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(n == 0);
+        const bool clearAll = ImGui::Button("Clear all");
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(n == 0);
+        if (ImGui::Button("Use all"))
+            for (ImageEntry& e : images) e.useForCalibration = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Use none"))
+            for (ImageEntry& e : images) e.useForCalibration = false;
+        ImGui::EndDisabled();
+
+        int selectRequest = -1;
+        const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                                      ImGuiTableFlags_SizingFixedFit;
+        if (ImGui::BeginTable("images", 4, flags, ImVec2(0, -1))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("image", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("corners");
+            ImGui::TableSetupColumn("rms px");
+            ImGui::TableSetupColumn("use");
+            ImGui::TableHeadersRow();
+
+            ImGuiListClipper clipper;
+            clipper.Begin(n);
+            if (scrollListToCurrent && current >= 0) clipper.IncludeItemByIndex(current);
+            while (clipper.Step()) {
+                for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+                    ImageEntry& e = images[i];
+                    ImGui::TableNextRow();
+                    ImGui::PushID(i);
+
+                    ImGui::TableSetColumnIndex(0);
+                    if (e.loadFailed) ImGui::PushStyleColor(ImGuiCol_Text, kBadColor);
+                    if (ImGui::Selectable(FileName(e.path).c_str(), i == current,
+                                          ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
+                        selectRequest = i;
+                    if (e.loadFailed) ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.path.c_str());
+                    if (scrollListToCurrent && i == current) ImGui::SetScrollHereY();
+
+                    ImGui::TableSetColumnIndex(1);
+                    if (e.loadFailed) ImGui::TextColored(kBadColor, "failed");
+                    else if (!e.detected) ImGui::TextDisabled("-");
+                    else if (e.det.CornerCount() < kMinVerifyCorners) ImGui::TextDisabled("%d", e.det.CornerCount());
+                    else
+                        ImGui::TextColored(e.det.CornerCount() == boardState.totalCorners ? kGoodColor : kPartialColor,
+                                           "%d", e.det.CornerCount());
+
+                    ImGui::TableSetColumnIndex(2);
+                    if (e.verify.ok)
+                        ImGui::TextColored(ToImVec4(ErrorColor(e.verify.rmsErrorPx)), "%.2f", e.verify.rmsErrorPx);
+                    else
+                        ImGui::TextDisabled("-");
+
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::Checkbox("##use", &e.useForCalibration);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Include in calibration");
+
+                    ImGui::PopID();
+                }
+            }
+            ImGui::EndTable();
+        }
+        scrollListToCurrent = false;
+        ImGui::End();
+
+        if (selectRequest >= 0 && selectRequest != current) Select(selectRequest);
+        if (removeCurrent) Remove(current);
+        if (clearAll) Clear();
+    }
+
+    void CalibrationPanel() {
+        ImGui::SetNextWindowPos(ImVec2((float)GetScreenWidth() - 390, 464), ImGuiCond_FirstUseEver);
+        // Fixed width, height following the content: the results section
+        // only appears after the first run and would otherwise be clipped.
+        ImGui::SetNextWindowSizeConstraints(ImVec2(380, 0), ImVec2(380, FLT_MAX));
+        ImGui::Begin("Calibration", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+
+        int modelIndex = static_cast<int>(calibModel);
+        ImGui::SetNextItemWidth(-60);
+        if (ImGui::BeginCombo("Model", ModelInfo(calibModel).label)) {
+            for (int m = 0; m < kCameraModelCount; ++m)
+                if (ImGui::Selectable(ModelInfo(static_cast<CameraModel>(m)).label, m == modelIndex)) modelIndex = m;
+            ImGui::EndCombo();
+        }
+        SetCalibrationModel(static_cast<CameraModel>(modelIndex));
+        const CameraModelInfo& info = ModelInfo(calibModel);
+
+        const int usable = (int)CalibrationCandidates().size();
+        const int done = DetectedCount();
+        ImGui::Text("%d image(s) selected with >= %d corners", usable, kMinVerifyCorners);
+        if (done < (int)images.size())
+            ImGui::TextColored(kWarnColor, "%d of %zu images not detected yet (Detect all)", (int)images.size() - done,
+                               images.size());
+
+        // Starting from the active camera needs one of the same model; show
+        // "generic" when there's no such camera without overwriting the
+        // choice for when there is.
+        const bool canStartFromCamera = cam.loaded && cam.model == calibModel;
+        bool generic = calibFromGeneric || !canStartFromCamera;
+        ImGui::BeginDisabled(!canStartFromCamera);
+        if (ImGui::Checkbox("Start from a generic guess", &generic)) calibFromGeneric = generic;
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", canStartFromCamera ? "Instead of the active camera's intrinsics"
+                                    : cam.loaded      ? "The active camera is a different model"
+                                                      : "No camera_info.yaml loaded to start from");
+
+        // One row per parameter: whether it's held, and — once this model
+        // has been calibrated — the result next to where it started.
+        const bool showResult = haveCalib && calib.ok && calib.camera.model == calibModel;
+        if (ImGui::BeginTable("params", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("param");
+            ImGui::TableSetupColumn("fix");
+            ImGui::TableSetupColumn("result");
+            ImGui::TableSetupColumn("1 sigma");
+            ImGui::TableSetupColumn("start");
+            ImGui::TableHeadersRow();
+            for (int k = 0; k < info.numParams; ++k) {
+                ImGui::PushID(k);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(info.paramNames[k]);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Checkbox("##fix", &calibOptions.fixed[k]);
+                if (calibModel == CameraModel::Mei && k == kMeiXi && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("xi trades off against fx/fy and k1..k3 and is poorly\n"
+                                      "constrained by a flat board; Insta360 pins it at 2");
+                if (showResult) {
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::Text("%.6g", calib.camera.params[k]);
+                    ImGui::TableSetColumnIndex(3);
+                    if (calib.stdDev[k] > 0.0) ImGui::Text("%.2g", calib.stdDev[k]);
+                    else ImGui::TextDisabled("fixed");
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::TextDisabled("%.6g", calibInitial.params[k]);
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+
+        ImGui::BeginDisabled(usable < kMinCalibrationViews || detectAllRunning);
+        if (ImGui::Button("Calibrate", ImVec2(-1, 0))) RunCalibration();
+        ImGui::EndDisabled();
+
+        if (haveCalib) {
+            ImGui::Separator();
+            if (!calib.ok) {
+                ImGui::TextColored(kBadColor, "Failed: %s", calib.message.c_str());
+            } else {
+                ImGui::TextWrapped("%s", calib.message.c_str());
+                ImGui::TextColored(ToImVec4(ErrorColor(calib.rmsPx)), "rms %.3f px", calib.rmsPx);
+                ImGui::SameLine();
+                ImGui::TextDisabled("(start: %s, rms %.3f px)", calibStartLabel.c_str(), calib.initialRmsPx);
+
+                if (calib.camera.model != calibModel &&
+                    ImGui::BeginTable("results", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                    // Result of a model other than the one now selected above.
+                    ImGui::TableSetupColumn("param");
+                    ImGui::TableSetupColumn("value");
+                    ImGui::TableSetupColumn("1 sigma");
+                    ImGui::TableHeadersRow();
+                    for (int k = 0; k < calib.camera.NumParams(); ++k) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted(calib.camera.Info().paramNames[k]);
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::Text("%.6g", calib.camera.params[k]);
+                        ImGui::TableSetColumnIndex(2);
+                        if (calib.stdDev[k] > 0.0) ImGui::Text("%.2g", calib.stdDev[k]);
+                        else ImGui::TextDisabled("fixed");
+                    }
+                    ImGui::EndTable();
+                }
+
+                if (ImGui::Button("Use as active camera")) ApplyCalibration();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Verify every image against these intrinsics\n(the images list rms updates)");
+
+                ImGui::SetNextItemWidth(-60);
+                if (ImGui::InputText("##savepath", savePath, sizeof(savePath))) overwriteArmed = false;
+                ImGui::SameLine();
+                if (ImGui::Button(overwriteArmed ? "Overwrite" : "Save", ImVec2(-1, 0))) SaveCalibration();
+                if (ImGui::IsItemHovered()) {
+                    if (calibTemplatePath.empty())
+                        ImGui::SetTooltip("Writes a new camera_info.yaml");
+                    else
+                        ImGui::SetTooltip("Writes a copy of %s with the intrinsics replaced\n"
+                                          "(serial, extrinsics and other fields kept)",
+                                          FileName(calibTemplatePath).c_str());
+                }
+            }
+        }
+        ImGui::End();
+    }
+};
+
+} // namespace
+
+int main(int argc, char** argv) {
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
+    InitWindow(1280, 960, "calib_app - camera calibration");
+    SetTargetFPS(60);
+    rlImGuiSetup(true);
+
+    App app;
+    std::vector<std::string> args(argv + 1, argv + argc);
+    if (args.empty())
+        std::printf("calib_app: nothing given — drop images, a capture folder, a camera_info.yaml and/or a meta.txt "
+                    "onto the window, or pass them as arguments\n");
+    else
+        app.LoadPaths(args);
+
+    while (!WindowShouldClose()) {
+        app.DetectAllStep();
+
+        BeginDrawing();
+        ClearBackground(DARKGRAY);
+
+        rlImGuiBegin();
+        const ImGuiIO& io = ImGui::GetIO();
+        const bool blockMouse    = io.WantCaptureMouse;
+        const bool blockKeyboard = io.WantCaptureKeyboard;
+
+        if (IsFileDropped()) {
+            FilePathList files = LoadDroppedFiles();
+            std::vector<std::string> paths(files.paths, files.paths + files.count);
+            UnloadDroppedFiles(files);
+            app.LoadPaths(paths);
+        }
+
+        app.HandleInput(blockMouse, blockKeyboard);
+        app.DrawImageAndOverlays();
+        app.DrawHud();
+        app.BoardPanel();
+        app.VerificationPanel();
+        app.ImagesPanel();
+        app.CalibrationPanel();
 
         rlImGuiEnd();
         EndDrawing();
     }
 
     rlImGuiShutdown();
-    if (imageLoaded) UnloadTexture(tex);
+    if (app.texLoaded) UnloadTexture(app.tex);
     CloseWindow();
     return 0;
 }
