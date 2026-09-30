@@ -56,7 +56,7 @@ Run `insta360-to-images --help` for the full set. The useful ones:
 | `--frame-step N` | Export only every Nth frame (1 = all, the default). Counts source frames, so `--max-frames 100 --frame-step 5` writes 20 images per lens. |
 | `--swap-lenses` | Map the second video track to `cam_front`. |
 | `--no-imu` / `--no-camera-info` / `--no-panorama` | Leave out `imu.csv` / the intrinsics sidecar / `panorama.jpg`. |
-| `--no-equirect` | Skip stitching the geometric per-frame equirect video (on by default, compute-heavy). |
+| `--equirect` | Stitch the geometric per-frame equirect video (off by default, compute-heavy). |
 | `--equirect-width N` | Equirect output width; height is always `N/2`. Default 3840. |
 | `--no-equirect-flip` | Don't rotate the equirect output 180 degrees; row 0 becomes the north pole instead of the south pole. The flip is on by default and, when applied, is a full rotation, not a mirror flip -- see below. |
 | `--relative-time` | Start timestamps at zero instead of the capture wall clock. |
@@ -78,7 +78,7 @@ Run `insta360-to-images --help` for the full set. The useful ones:
     ...
   imu.csv                         # timestamp_ns,accel_x_mps2,...,gyro_z_radps at ~1 kHz
   panorama.jpg                    # the camera's own firmware-stitched equirect preview
-  equirect/                       # unless --no-equirect
+  equirect/                       # only with --equirect
     equirectangular_<timestamp_ns>.jpg # one geometrically stitched equirect frame per video frame
 ```
 
@@ -106,10 +106,10 @@ JPEG via `cv::imwrite`.
 
 ### `equirect/`
 
-By default this tool computes a real per-frame geometric equirectangular stitch, at
-`--equirect-width` resolution (default 3840x1920), one JPEG per video frame, named
-`equirectangular_<timestamp_ns>.jpg`; pass `--no-equirect` to skip it (it's
-compute-heavy). Row 0 is the south pole by default (the 180-degree flip, see below,
+With `--equirect` this tool computes a real per-frame geometric equirectangular
+stitch, at `--equirect-width` resolution (default 3840x1920), one JPEG per video
+frame, named `equirectangular_<timestamp_ns>.jpg`; it's off by default because it's
+compute-heavy. Row 0 is the south pole by default (the 180-degree flip, see below,
 is applied unless you pass `--no-equirect-flip`); pass `--no-equirect-flip` if your
 consumer expects row 0 at the north pole (straight up) instead. The flip does a full
 180-degree rotation (`cv::ROTATE_180`), not a single-axis flip: negating only
