@@ -21,6 +21,10 @@ struct Options {
     bool swap_lenses = false;
     bool relative_time = false;
     double time_offset_s = 0.0;  // added to every timestamp written (frames and imu.csv)
+    // Folder of an external IMU's imu*.csv logs: when set, the camera clock is shifted
+    // onto that IMU's clock by gyro cross-correlation (on top of time_offset_s).
+    std::optional<std::string> align_imu_dir;
+    double align_max_lag_s = 60.0;  // search window for that shift
     bool include_imu = true;
     bool include_camera_info = true;
     bool include_panorama = true;
@@ -36,6 +40,8 @@ struct Summary {
     int64_t end_ns = 0;
     std::map<std::string, int64_t> counts;  // e.g. "cam_front" -> frames written, "imu" -> samples
     std::vector<std::string> warnings;
+    std::optional<double> aligned_offset_s;  // set when align_imu_dir was used
+    double aligned_correlation = 0.0;
 
     int64_t total() const {
         int64_t sum = 0;

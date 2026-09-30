@@ -23,6 +23,7 @@ add_library(insta360_core
   src/media.cpp
   src/panorama.cpp
   src/equirect.cpp
+  src/imu_align.cpp
   src/convert.cpp
 )
 target_include_directories(insta360_core PUBLIC include ${OpenCV_INCLUDE_DIRS})

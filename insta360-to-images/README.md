@@ -61,6 +61,8 @@ Run `insta360-to-images --help` for the full set. The useful ones:
 | `--no-equirect-flip` | Don't rotate the equirect output 180 degrees; row 0 becomes the north pole instead of the south pole. The flip is on by default and, when applied, is a full rotation, not a mirror flip -- see below. |
 | `--relative-time` | Start timestamps at zero instead of the capture wall clock. |
 | `--time-offset SECONDS` | Shift every written timestamp by SECONDS (fractional and negative both accepted), to align the clip against another clock. |
+| `--align-imus DIR` | Shift every timestamp onto an external IMU's clock (e.g. a Mandeye lidar logger), found by cross-correlating gyro magnitudes against `DIR/imu*.csv`. Added to any `--time-offset`; needs the camera wall clock, so not with `--relative-time`. |
+| `--align-max-lag SECONDS` | Largest clock offset `--align-imus` searches, either direction. Default 60. |
 | `-f`, `--force` | Write into a non-empty output directory. |
 
 ## Output layout

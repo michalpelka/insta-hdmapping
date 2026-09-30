@@ -13,6 +13,7 @@
 
 #include "insta360/calibration.hpp"
 #include "insta360/equirect.hpp"
+#include "insta360/imu_align.hpp"
 #include "insta360/media.hpp"
 #include "insta360/metadata.hpp"
 #include "insta360/panorama.hpp"
@@ -271,8 +272,10 @@ Summary convert(const Options& options, const std::function<void(const std::stri
     }
 
     std::vector<ImuSample> imu_samples;
-    if (options.include_imu && trailer.contains(REC_IMU)) {
+    if ((options.include_imu || options.align_imu_dir) && trailer.contains(REC_IMU)) {
         imu_samples = read_imu(trailer.read(REC_IMU), meta.accel_range_g, meta.gyro_range_dps);
+    } else if (options.align_imu_dir) {
+        throw std::runtime_error("file carries no IMU record, so it cannot be aligned by IMU");
     } else if (options.include_imu) {
         summary.warnings.push_back("file carries no IMU record");
     }
@@ -292,7 +295,48 @@ Summary convert(const Options& options, const std::function<void(const std::stri
     if (!clock && !options.relative_time) {
         summary.warnings.push_back("metadata carries no wall-clock reference; timestamps start at zero");
     }
-    TimeBase time_of(clock, origin_us, options.relative_time || !clock, options.time_offset_s);
+    double offset_s = options.time_offset_s;
+    if (options.align_imu_dir) {
+        if (!clock || options.relative_time) {
+            throw std::runtime_error(
+                "IMU alignment needs the camera's wall clock (not --relative-time)");
+        }
+        log("aligning camera IMU against " + *options.align_imu_dir);
+        GyroSeries reference = read_gyro_csv_dir(*options.align_imu_dir);
+        TimeBase unshifted(clock, origin_us, false, 0.0);
+        GyroSeries camera_gyro;
+        for (const auto& sample : imu_samples) {
+            camera_gyro.t_ns.push_back(unshifted(sample.device_us));
+            camera_gyro.magnitude_radps.push_back(std::sqrt(sample.gyro[0] * sample.gyro[0] +
+                                                            sample.gyro[1] * sample.gyro[1] +
+                                                            sample.gyro[2] * sample.gyro[2]));
+        }
+        TimeAlignment alignment =
+            align_gyro_magnitudes(reference, camera_gyro, options.align_max_lag_s);
+        if (alignment.correlation < 0.5) {
+            throw std::runtime_error("IMU alignment found no convincing match (best r = " +
+                                     std::to_string(alignment.correlation) + ")");
+        }
+        if (alignment.correlation < 0.9) {
+            summary.warnings.push_back("IMU alignment correlation is only " +
+                                       std::to_string(alignment.correlation) +
+                                       "; check the offset before trusting it");
+        }
+        if (alignment.at_search_edge) {
+            summary.warnings.push_back(
+                "IMU alignment peak sits at the edge of the search window; the real offset may "
+                "be larger");
+        }
+        std::ostringstream message;
+        message.precision(6);
+        message << std::fixed << "IMU alignment: offset " << alignment.offset_s << " s, r = "
+                << alignment.correlation << " over " << alignment.overlap_s << " s";
+        log(message.str());
+        summary.aligned_offset_s = alignment.offset_s;
+        summary.aligned_correlation = alignment.correlation;
+        offset_s += alignment.offset_s;
+    }
+    TimeBase time_of(clock, origin_us, options.relative_time || !clock, offset_s);
 
     // -- lenses -----------------------------------------------------------------
     std::vector<int> lens_order(container_probe.video.size());

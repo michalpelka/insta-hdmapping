@@ -7,6 +7,7 @@ add_executable(insta360_tests
   convert_test.cpp
   panorama_test.cpp
   equirect_test.cpp
+  imu_align_test.cpp
 )
 target_link_libraries(insta360_tests PRIVATE insta360_core)
 target_include_directories(insta360_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

@@ -98,6 +98,10 @@ void print_usage() {
               << "                          north pole instead of south)\n"
               << "  --relative-time         start timestamps at zero instead of the camera's "
                  "wall clock\n"
+              << "  --align-imus DIR        shift timestamps onto an external IMU's clock by\n"
+                 "                          matching gyro magnitudes against DIR/imu*.csv\n"
+                 "                          (added to any --time-offset)\n"
+              << "  --align-max-lag SECONDS largest clock offset --align-imus searches; default 60\n"
               << "  --time-offset SECONDS   shift every written timestamp by SECONDS; may be\n"
               << "                          fractional or negative\n"
               << "  -f, --force             write into a non-empty output directory\n"
@@ -122,6 +126,8 @@ struct ParsedArgs {
     bool equirect_flip = true;
     bool relative_time = false;
     double time_offset_s = 0.0;
+    std::optional<std::string> align_imu_dir;
+    double align_max_lag_s = 60.0;
     bool force = false;
     bool quiet = false;
 };
@@ -175,6 +181,11 @@ std::optional<ParsedArgs> parse_args(int argc, char** argv) {
             args.relative_time = true;
         } else if (token == "--time-offset") {
             args.time_offset_s = parse_seconds(next_value(i, token), token);
+        } else if (token == "--align-imus") {
+            args.align_imu_dir = next_value(i, token);
+        } else if (token == "--align-max-lag") {
+            args.align_max_lag_s = parse_seconds(next_value(i, token), token);
+            if (args.align_max_lag_s <= 0) throw std::invalid_argument(token + " must be positive");
         } else if (token == "-f" || token == "--force") {
             args.force = true;
         } else if (token == "-q" || token == "--quiet") {
@@ -189,6 +200,9 @@ std::optional<ParsedArgs> parse_args(int argc, char** argv) {
         }
     }
     if (!have_input) throw std::invalid_argument("input file is required");
+    if (args.align_imu_dir && args.relative_time) {
+        throw std::invalid_argument("--align-imus needs the camera wall clock; drop --relative-time");
+    }
     return args;
 }
 
@@ -365,6 +379,8 @@ int main(int argc, char** argv) {
     options.swap_lenses = args.swap_lenses;
     options.relative_time = args.relative_time;
     options.time_offset_s = args.time_offset_s;
+    options.align_imu_dir = args.align_imu_dir;
+    options.align_max_lag_s = args.align_max_lag_s;
     options.include_imu = args.include_imu;
     options.include_camera_info = args.include_camera_info;
     options.include_panorama = args.include_panorama;
