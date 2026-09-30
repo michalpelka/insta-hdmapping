@@ -123,5 +123,12 @@ Detection DetectCharuco(const cv::Mat& bgr, const BoardState& b) {
                                               d.charucoCorners, d.charucoIds);
     }
 #endif
+    // OpenCV 5's CharucoDetector hands back 1xN rows where 4.x gave Nx1
+    // columns; normalize to the Nx1 layout Detection documents, since
+    // everything downstream counts corners via .rows.
+    if (!d.charucoIds.empty()) {
+        d.charucoIds = d.charucoIds.reshape(1, (int)d.charucoIds.total());
+        d.charucoCorners = d.charucoCorners.reshape(2, (int)d.charucoCorners.total());
+    }
     return d;
 }
