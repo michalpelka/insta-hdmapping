@@ -33,8 +33,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Union of both subprojects' dependencies: OpenCV/ffmpeg for
-      # insta360-to-images, yaml-cpp, Ceres and the X11/GL headers raylib's
+      # Union of both subprojects' dependencies: ffmpeg (runtime, for the
+      # insta360-to-images tests), OpenCV, yaml-cpp, Ceres and the X11/GL headers raylib's
       # static build needs for insta360-test-calib (raylib bundles its own
       # GLFW source, so no glfw dev package is needed).
       - name: Install dependencies (Linux)

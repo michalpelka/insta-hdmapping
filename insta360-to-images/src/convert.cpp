@@ -9,13 +9,10 @@
 #include <sstream>
 #include <stdexcept>
 
-#include <opencv2/imgcodecs.hpp>
-
 #include "insta360/calibration.hpp"
-#include "insta360/equirect.hpp"
+#include "insta360/imu_align.hpp"
 #include "insta360/media.hpp"
 #include "insta360/metadata.hpp"
-#include "insta360/panorama.hpp"
 #include "insta360/sensors.hpp"
 #include "insta360/trailer.hpp"
 
@@ -73,12 +70,11 @@ struct Camera {
 
 std::map<int, LensCalibration> lens_calibration(const Metadata& meta, int width, int height,
                                                  Summary& summary) {
-    auto text = meta.calibration_string("offset_v2");
-    if (!text) {
+    if (!meta.calibration_string("offset_v2") && !meta.calibration_string("offset_v3")) {
         summary.warnings.push_back("no lens calibration in metadata; intrinsics sidecar omitted");
         return {};
     }
-    auto lenses = parse_offset_v2(*text, width, height);
+    auto lenses = parse_lenses(meta, width, height);
     if (lenses.empty()) {
         summary.warnings.push_back(
             "lens calibration string had an unexpected layout; intrinsics sidecar omitted");
@@ -149,6 +145,14 @@ void write_camera_info(const fs::path& path, const Camera& camera) {
         << yaml_array(std::vector<double>(lens.rotation_deg.begin(), lens.rotation_deg.end())) << "\n";
     out << "translation: "
         << yaml_array(std::vector<double>(lens.translation.begin(), lens.translation.end())) << "\n";
+    out << "calibration_source: " << lens.source << "\n";
+    if (lens.source != "offset_v2") {
+        // `distortion` above is a refit (see calibration.hpp); keep what the camera
+        // actually wrote alongside it, and how far the refit strays from it.
+        out << "source_distortion: " << yaml_array(lens.source_distortion) << "\n";
+        out << "refit_max_error_px: " << yaml_number(lens.refit_max_error_px) << "\n";
+        out << "refit_max_theta_deg: " << yaml_number(lens.refit_max_theta_deg) << "\n";
+    }
     if (!out) throw std::runtime_error("could not write " + path.string());
 }
 
@@ -271,8 +275,10 @@ Summary convert(const Options& options, const std::function<void(const std::stri
     }
 
     std::vector<ImuSample> imu_samples;
-    if (options.include_imu && trailer.contains(REC_IMU)) {
+    if ((options.include_imu || options.align_imu_dir) && trailer.contains(REC_IMU)) {
         imu_samples = read_imu(trailer.read(REC_IMU), meta.accel_range_g, meta.gyro_range_dps);
+    } else if (options.align_imu_dir) {
+        throw std::runtime_error("file carries no IMU record, so it cannot be aligned by IMU");
     } else if (options.include_imu) {
         summary.warnings.push_back("file carries no IMU record");
     }
@@ -292,7 +298,48 @@ Summary convert(const Options& options, const std::function<void(const std::stri
     if (!clock && !options.relative_time) {
         summary.warnings.push_back("metadata carries no wall-clock reference; timestamps start at zero");
     }
-    TimeBase time_of(clock, origin_us, options.relative_time || !clock, options.time_offset_s);
+    double offset_s = options.time_offset_s;
+    if (options.align_imu_dir) {
+        if (!clock || options.relative_time) {
+            throw std::runtime_error(
+                "IMU alignment needs the camera's wall clock (not --relative-time)");
+        }
+        log("aligning camera IMU against " + *options.align_imu_dir);
+        GyroSeries reference = read_gyro_csv_dir(*options.align_imu_dir);
+        TimeBase unshifted(clock, origin_us, false, 0.0);
+        GyroSeries camera_gyro;
+        for (const auto& sample : imu_samples) {
+            camera_gyro.t_ns.push_back(unshifted(sample.device_us));
+            camera_gyro.magnitude_radps.push_back(std::sqrt(sample.gyro[0] * sample.gyro[0] +
+                                                            sample.gyro[1] * sample.gyro[1] +
+                                                            sample.gyro[2] * sample.gyro[2]));
+        }
+        TimeAlignment alignment =
+            align_gyro_magnitudes(reference, camera_gyro, options.align_max_lag_s);
+        if (alignment.correlation < 0.5) {
+            throw std::runtime_error("IMU alignment found no convincing match (best r = " +
+                                     std::to_string(alignment.correlation) + ")");
+        }
+        if (alignment.correlation < 0.9) {
+            summary.warnings.push_back("IMU alignment correlation is only " +
+                                       std::to_string(alignment.correlation) +
+                                       "; check the offset before trusting it");
+        }
+        if (alignment.at_search_edge) {
+            summary.warnings.push_back(
+                "IMU alignment peak sits at the edge of the search window; the real offset may "
+                "be larger");
+        }
+        std::ostringstream message;
+        message.precision(6);
+        message << std::fixed << "IMU alignment: offset " << alignment.offset_s << " s, r = "
+                << alignment.correlation << " over " << alignment.overlap_s << " s";
+        log(message.str());
+        summary.aligned_offset_s = alignment.offset_s;
+        summary.aligned_correlation = alignment.correlation;
+        offset_s += alignment.offset_s;
+    }
+    TimeBase time_of(clock, origin_us, options.relative_time || !clock, offset_s);
 
     // -- lenses -----------------------------------------------------------------
     std::vector<int> lens_order(container_probe.video.size());
@@ -335,39 +382,6 @@ Summary convert(const Options& options, const std::function<void(const std::stri
     if (options.include_imu && !imu_samples.empty()) {
         write_imu_csv(output_dir / "imu.csv", imu_samples, time_of);
         summary.counts["imu"] = static_cast<int64_t>(imu_samples.size());
-    }
-
-    if (options.include_panorama) {
-        if (trailer.contains(REC_PREVIEW)) {
-            PreviewImage preview = read_preview(trailer.read(REC_PREVIEW));
-            write_panorama_preview(preview, (output_dir / "panorama.jpg").string());
-            summary.counts["panorama"] = 1;
-        } else {
-            summary.warnings.push_back(
-                "file carries no embedded preview image; panorama.jpg omitted");
-        }
-    }
-
-    // -- geometric equirectangular stitch (opt-in; see equirect.hpp) ---------------
-    bool do_equirect = options.include_equirect;
-    std::vector<EquirectMaps> equirect_maps;  // indexed like `cameras`, when do_equirect
-    fs::path equirect_dir = output_dir / "equirect";
-    if (do_equirect) {
-        if (cameras.size() != 2 || !cameras[0].calibration || !cameras[1].calibration) {
-            summary.warnings.push_back(
-                "equirect stitching needs both lenses' calibration; panorama.jpg (if enabled) "
-                "is the fallback");
-            do_equirect = false;
-        } else {
-            int eq_width = options.equirect_width;
-            int eq_height = eq_width / 2;
-            for (size_t slot = 0; slot < cameras.size(); ++slot) {
-                bool is_back_lens = cameras[slot].name == "cam_back";
-                equirect_maps.push_back(
-                    build_equirect_maps(*cameras[slot].calibration, eq_width, eq_height, is_back_lens));
-            }
-            fs::create_directories(equirect_dir);
-        }
     }
 
     // -- video ---------------------------------------------------------------------
@@ -414,8 +428,7 @@ Summary convert(const Options& options, const std::function<void(const std::stri
             }
             int64_t log_time = time_of(frames.device_us[index]);
             // Every frame still has to be pulled off both pipes to keep the two lenses in
-            // lockstep; --frame-step only decides which of them reach the disk, which is
-            // where the equirect stitch (the expensive part) is skipped too.
+            // lockstep; --frame-step only decides which of them reach the disk.
             if (index % options.frame_step != 0) {
                 last_ns = std::max(last_ns, log_time);
                 report_progress(index + 1);
@@ -432,28 +445,6 @@ Summary convert(const Options& options, const std::function<void(const std::stri
                           static_cast<std::streamsize>(frame_data[i]->size()));
                 if (!out) throw std::runtime_error("could not write " + filename.string());
                 summary.counts[cameras[i].name]++;
-            }
-            if (do_equirect) {
-                cv::Mat front_fisheye = cv::imdecode(*frame_data[0], cv::IMREAD_COLOR);
-                cv::Mat back_fisheye = cv::imdecode(*frame_data[1], cv::IMREAD_COLOR);
-                cv::Mat front_eq = remap_to_equirect(front_fisheye, equirect_maps[0]);
-                cv::Mat back_eq = remap_to_equirect(back_fisheye, equirect_maps[1]);
-                cv::Mat stitched =
-                    blend_equirect(front_eq, equirect_maps[0].weight, back_eq, equirect_maps[1].weight);
-                if (options.equirect_rotate_180) {
-                    // A full 180-degree rotation (both axes), not a single-axis flip: on
-                    // an equirect sphere, negating latitude alone (or longitude alone)
-                    // is a mirror reflection -- it reverses the scene's handedness, so
-                    // panning left vs. right would feel backwards in a viewer. Rotating
-                    // both axes swaps the pole while preserving handedness; the
-                    // resulting longitude shift is invisible since the image wraps.
-                    cv::rotate(stitched, stitched, cv::ROTATE_180);
-                }
-                fs::path filename = equirect_dir / ("equirectangular_" + std::to_string(log_time) + ".jpg");
-                if (!cv::imwrite(filename.string(), stitched)) {
-                    throw std::runtime_error("could not write " + filename.string());
-                }
-                summary.counts["equirect"]++;
             }
             last_ns = std::max(last_ns, log_time);
             report_progress(index + 1);

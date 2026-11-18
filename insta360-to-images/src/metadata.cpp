@@ -18,6 +18,7 @@ constexpr int F_FIRST_FRAME_US = 24;
 constexpr int F_SOURCE = 26;            // sub-message, {3: original path on the SD card}
 constexpr int F_OFFSET = 5;
 constexpr int F_START_EPOCH_MS = 36;
+constexpr int F_FRAME_COUNT = 40;       // X6; the X5 carries this in F_CLOCK instead
 constexpr int F_OFFSET_V2 = 54;
 constexpr int F_SENSOR_RANGES = 65;     // sub-message {1: accel full scale g, 2: gyro full scale dps}
 constexpr int F_DURATION_MS = 93;
@@ -61,6 +62,11 @@ Metadata parse_metadata(const std::vector<uint8_t>& raw) {
     if (auto start = message.uint(F_START_EPOCH_MS)) {
         meta.start_epoch_ms = static_cast<int64_t>(*start);
     }
+    // Zero on the X5 (which leaves the count to F_CLOCK), so only a positive value
+    // counts as present.
+    if (auto count = message.uint(F_FRAME_COUNT); count && *count > 0) {
+        meta.frame_count = static_cast<int64_t>(*count);
+    }
 
     if (auto source = message.message(F_SOURCE)) {
         meta.source_path = source->text(3);
@@ -102,11 +108,18 @@ Metadata parse_metadata(const std::vector<uint8_t>& raw) {
         }
     }
 
-    if (auto v2 = meta.calibration_string("offset_v2"); v2 && meta.width && meta.height) {
-        meta.lenses = parse_offset_v2(*v2, *meta.width, *meta.height);
-    }
+    if (meta.width && meta.height) meta.lenses = parse_lenses(meta, *meta.width, *meta.height);
 
     return meta;
+}
+
+std::vector<LensCalibration> parse_lenses(const Metadata& meta, int width, int height) {
+    if (auto v2 = meta.calibration_string("offset_v2")) {
+        auto lenses = parse_offset_v2(*v2, width, height);
+        if (!lenses.empty()) return lenses;
+    }
+    if (auto v3 = meta.calibration_string("offset_v3")) return parse_offset_v3(*v3, width, height);
+    return {};
 }
 
 }  // namespace insta360

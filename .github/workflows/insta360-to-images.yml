@@ -29,12 +29,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libopencv-dev ffmpeg
+          sudo apt-get install -y ffmpeg
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install opencv ffmpeg
+          brew install ffmpeg
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

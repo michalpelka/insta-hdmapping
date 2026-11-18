@@ -79,6 +79,11 @@ struct Metadata {
 // Decodes trailer record 0x0101 into a Metadata.
 Metadata parse_metadata(const std::vector<uint8_t>& raw);
 
+// The lens calibration rescaled to width x height: offset_v2 when the file has a
+// usable one (X5 and earlier; the format this tool was validated on), else
+// offset_v3 (all an X6 writes). Empty when neither parses.
+std::vector<LensCalibration> parse_lenses(const Metadata& meta, int width, int height);
+
 // Renders the packed YYYYMMDDhhmmss integer as an ISO-8601-ish local timestamp.
 std::optional<std::string> format_capture_datetime(std::optional<int64_t> value);
 
