@@ -3,10 +3,9 @@ add_executable(insta360_tests
   protobuf_test.cpp
   trailer_test.cpp
   calibration_test.cpp
+  metadata_test.cpp
   sensors_test.cpp
   convert_test.cpp
-  panorama_test.cpp
-  equirect_test.cpp
   imu_align_test.cpp
 )
 target_link_libraries(insta360_tests PRIVATE insta360_core)

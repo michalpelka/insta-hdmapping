@@ -88,14 +88,6 @@ void print_usage() {
               << "  --swap-lenses           map the second video track to cam_front\n"
               << "  --no-imu                leave out imu.csv\n"
               << "  --no-camera-info        leave out the per-camera intrinsics sidecar\n"
-              << "  --no-panorama           leave out panorama.jpg (the camera's own\n"
-              << "                          firmware-stitched preview)\n"
-              << "  --equirect              stitch the geometric per-frame equirect\n"
-              << "                          panorama video (compute-heavy; see README)\n"
-              << "  --equirect-width N      equirect output width, height is N/2; default 3840\n"
-              << "  --no-equirect-flip      don't rotate the equirect output 180 degrees "
-                 "(row 0 =\n"
-              << "                          north pole instead of south)\n"
               << "  --relative-time         start timestamps at zero instead of the camera's "
                  "wall clock\n"
               << "  --align-imus DIR        shift timestamps onto an external IMU's clock by\n"
@@ -120,10 +112,6 @@ struct ParsedArgs {
     bool swap_lenses = false;
     bool include_imu = true;
     bool include_camera_info = true;
-    bool include_panorama = true;
-    bool include_equirect = false;
-    int equirect_width = 3840;
-    bool equirect_flip = true;
     bool relative_time = false;
     double time_offset_s = 0.0;
     std::optional<std::string> align_imu_dir;
@@ -167,16 +155,6 @@ std::optional<ParsedArgs> parse_args(int argc, char** argv) {
             args.include_imu = false;
         } else if (token == "--no-camera-info") {
             args.include_camera_info = false;
-        } else if (token == "--no-panorama") {
-            args.include_panorama = false;
-        } else if (token == "--equirect") {
-            args.include_equirect = true;
-        } else if (token == "--equirect-width") {
-            args.equirect_width = std::stoi(next_value(i, token));
-        } else if (token == "--equirect-flip") {
-            args.equirect_flip = true;
-        } else if (token == "--no-equirect-flip") {
-            args.equirect_flip = false;
         } else if (token == "--relative-time") {
             args.relative_time = true;
         } else if (token == "--time-offset") {
@@ -306,6 +284,17 @@ int run_inspect(const std::string& path) {
                 std::cout << lens.distortion[i];
             }
             std::cout << "]\n";
+            if (lens.source != "offset_v2") {
+                std::cout << "    k1-k3 refitted from " << lens.source << "'s k1-k4: max error "
+                          << lens.refit_max_error_px << " px out to " << lens.refit_max_theta_deg
+                          << " deg\n";
+                std::cout << "    " << lens.source << " distortion [";
+                for (size_t i = 0; i < lens.source_distortion.size(); ++i) {
+                    if (i) std::cout << ", ";
+                    std::cout << lens.source_distortion[i];
+                }
+                std::cout << "]\n";
+            }
         }
     }
 
@@ -383,10 +372,6 @@ int main(int argc, char** argv) {
     options.align_max_lag_s = args.align_max_lag_s;
     options.include_imu = args.include_imu;
     options.include_camera_info = args.include_camera_info;
-    options.include_panorama = args.include_panorama;
-    options.include_equirect = args.include_equirect;
-    options.equirect_width = args.equirect_width;
-    options.equirect_rotate_180 = args.equirect_flip;
     options.force = args.force;
 
     auto log = args.quiet ? std::function<void(const std::string&)>([](const std::string&) {})

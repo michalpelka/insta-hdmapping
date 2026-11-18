@@ -27,10 +27,6 @@ struct Options {
     double align_max_lag_s = 60.0;  // search window for that shift
     bool include_imu = true;
     bool include_camera_info = true;
-    bool include_panorama = true;
-    bool include_equirect = false;  // opt-in: geometric per-frame stitch, compute-heavy
-    int equirect_width = 3840;      // height is always half this
-    bool equirect_rotate_180 = false;  // for consumers expecting row 0 = south pole
     bool force = false;
 };
 

@@ -88,33 +88,3 @@ TEST(frame_timestamps_throws_with_no_usable_timing_source) {
     std::vector<ExposureSample> exposures;
     CHECK_THROWS(frame_timestamps(exposures, std::nullopt, 3, std::nullopt));
 }
-
-TEST(read_preview_decodes_header_and_trims_payload_to_nv12_size) {
-    const int width = 4, height = 2;
-    std::vector<uint8_t> raw(PREVIEW_HEADER_LEN, 0);
-    // Header is 10 little-endian uint32s; words 4 and 5 are width/height.
-    std::memcpy(raw.data() + 4 * 4, &width, 4);
-    std::memcpy(raw.data() + 4 * 5, &height, 4);
-    size_t nv12_size = static_cast<size_t>(width) * height * 3 / 2;  // 12 bytes
-    std::vector<uint8_t> payload(nv12_size + 5, 0xAB);               // 5 bytes of trailing junk
-    for (size_t i = 0; i < nv12_size; ++i) payload[i] = static_cast<uint8_t>(i);
-    raw.insert(raw.end(), payload.begin(), payload.end());
-
-    PreviewImage preview = read_preview(raw);
-    CHECK_EQ(preview.width, width);
-    CHECK_EQ(preview.height, height);
-    CHECK_EQ(preview.nv12.size(), nv12_size);
-    CHECK_EQ(static_cast<int>(preview.nv12[0]), 0);
-    CHECK_EQ(static_cast<int>(preview.nv12[nv12_size - 1]), static_cast<int>(nv12_size - 1));
-}
-
-TEST(read_preview_rejects_short_or_truncated_records) {
-    CHECK_THROWS(read_preview(std::vector<uint8_t>(10, 0)));  // shorter than the header
-
-    std::vector<uint8_t> raw(PREVIEW_HEADER_LEN, 0);
-    int width = 100, height = 100;
-    std::memcpy(raw.data() + 4 * 4, &width, 4);
-    std::memcpy(raw.data() + 4 * 5, &height, 4);
-    // Claims 100x100 NV12 (15000 bytes) but carries none.
-    CHECK_THROWS(read_preview(raw));
-}
