@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <string_view>
 
 #include "test_util.hpp"
 
@@ -89,6 +90,57 @@ TEST(read_gyro_csv_dir_merges_mandeye_and_own_formats) {
     CHECK_EQ(series.t_ns[1], 3000);
     CHECK_NEAR(series.magnitude_radps[1], 5.0, 1e-12);
     CHECK_EQ(series.t_ns[2], 4000);
+    fs::remove_all(dir);
+}
+
+namespace {
+
+constexpr std::string_view kMandeyeHeader =
+    "timestamp gyroX gyroY gyroZ accX accY accZ imuId timestampUnix\n";
+constexpr std::string_view kMurataHeader =
+    "timestamp gyroX gyroY gyroZ accX accY accZ timestampUnix\n";
+
+}  // namespace
+
+TEST(read_gyro_csv_dir_falls_back_to_the_murata_imu_of_a_hesai_session) {
+    // A Hesai-based Mandeye session: imu*.csv are header-only, the gyro lives in
+    // MURATA_IMU/murata_imu_<ns>.csv. Both the session folder and MURATA_IMU itself work.
+    fs::path dir = fs::temp_directory_path() / "insta360_imu_align_murata_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "MURATA_IMU");
+    {
+        std::ofstream(dir / "imu0000.csv") << kMandeyeHeader;
+        std::ofstream(dir / "imu0001.csv") << kMandeyeHeader;
+        std::ofstream(dir / "MURATA_IMU" / "murata_imu_4000.csv")
+            << kMurataHeader << "3000 0 3 4 0 0 1 3000\n"
+            << "4000 2 0 0 0 0 1 4000\n";
+        std::ofstream(dir / "MURATA_IMU" / "murata_imu_2000.csv")
+            << kMurataHeader << "1000 0 0 1 0 0 1 1000\n";
+    }
+    for (const fs::path& target : {dir, dir / "MURATA_IMU"}) {
+        GyroSeries series = read_gyro_csv_dir(target.string());
+        CHECK_EQ(series.t_ns.size(), 3u);
+        CHECK_EQ(series.t_ns[0], 1000);
+        CHECK_NEAR(series.magnitude_radps[1], 5.0, 1e-12);
+        CHECK_EQ(series.t_ns[2], 4000);
+        CHECK(series.source.find("murata_imu*.csv (2 files)") != std::string::npos);
+    }
+    fs::remove_all(dir);
+}
+
+TEST(read_gyro_csv_dir_prefers_the_lidar_imu_and_never_mixes_sensors) {
+    fs::path dir = fs::temp_directory_path() / "insta360_imu_align_both_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "MURATA_IMU");
+    {
+        std::ofstream(dir / "imu0000.csv") << kMandeyeHeader << "1000 0 0 1 0 0 1 0 1\n"
+                                           << "3000 0 0 1 0 0 1 0 3\n";
+        std::ofstream(dir / "MURATA_IMU" / "murata_imu_2000.csv")
+            << kMurataHeader << "2000 0 0 7 0 0 1 2000\n";
+    }
+    GyroSeries series = read_gyro_csv_dir(dir.string());
+    CHECK_EQ(series.t_ns.size(), 2u);
+    CHECK_EQ(series.t_ns[1], 3000);
     fs::remove_all(dir);
 }
 

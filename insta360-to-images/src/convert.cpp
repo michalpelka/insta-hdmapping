@@ -306,6 +306,14 @@ Summary convert(const Options& options, const std::function<void(const std::stri
         }
         log("aligning camera IMU against " + *options.align_imu_dir);
         GyroSeries reference = read_gyro_csv_dir(*options.align_imu_dir);
+        {
+            std::ostringstream message;
+            message.precision(1);
+            message << std::fixed << "reference IMU: " << reference.source << ", "
+                    << reference.t_ns.size() << " samples over "
+                    << (reference.t_ns.back() - reference.t_ns.front()) / 1e9 << " s";
+            log(message.str());
+        }
         TimeBase unshifted(clock, origin_us, false, 0.0);
         GyroSeries camera_gyro;
         for (const auto& sample : imu_samples) {

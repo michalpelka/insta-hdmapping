@@ -8,6 +8,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 
 namespace fs = std::filesystem;
 
@@ -31,8 +32,8 @@ std::vector<std::string> split_fields(const std::string& line) {
     return fields;
 }
 
-int find_column(const std::vector<std::string>& header, std::initializer_list<const char*> names) {
-    for (const char* name : names) {
+int find_column(const std::vector<std::string>& header, std::initializer_list<std::string_view> names) {
+    for (std::string_view name : names) {
         auto it = std::find(header.begin(), header.end(), name);
         if (it != header.end()) return static_cast<int>(it - header.begin());
     }
@@ -159,34 +160,62 @@ Peak search(const Grid& ref, const Grid& cam, int64_t lag_min, int64_t lag_max, 
     return best;
 }
 
+// The <prefix>*.csv files directly in `dir`, sorted by name; none if `dir` is absent.
+std::vector<fs::path> csv_files(const fs::path& dir, std::string_view prefix) {
+    std::vector<fs::path> files;
+    if (!fs::is_directory(dir)) return files;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        std::string name = entry.path().filename().string();
+        if (entry.is_regular_file() && name.rfind(prefix, 0) == 0 && entry.path().extension() == ".csv") {
+            files.push_back(entry.path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
 }  // namespace
 
 GyroSeries read_gyro_csv_dir(const std::string& dir) {
     if (!fs::is_directory(dir)) throw std::runtime_error(dir + " is not a directory");
-    std::vector<fs::path> files;
-    for (const auto& entry : fs::directory_iterator(dir)) {
-        std::string name = entry.path().filename().string();
-        if (entry.is_regular_file() && name.rfind("imu", 0) == 0 && entry.path().extension() == ".csv") {
-            files.push_back(entry.path());
+    const fs::path root(dir);
+
+    // The first of these that yields samples is used alone: two sensors merged into one
+    // series would interleave their noise and filtering, and may not share a clock.
+    struct Source {
+        fs::path folder;
+        std::string_view prefix;
+    };
+    const Source sources[] = {
+        {root, "imu"},                        // Mandeye's lidar IMU, or this tool's imu.csv
+        {root / "MURATA_IMU", "murata_imu"},  // Mandeye's separate Murata IMU
+        {root, "murata_imu"},                 // `dir` is that MURATA_IMU folder itself
+    };
+    std::string searched;
+    for (const auto& source : sources) {
+        std::string pattern = (source.folder / (std::string(source.prefix) + "*.csv")).string();
+        searched += (searched.empty() ? "" : ", ") + pattern;
+        std::vector<fs::path> files = csv_files(source.folder, source.prefix);
+        // A Hesai-based Mandeye logs header-only imu*.csv files, so an empty source falls
+        // through to the next.
+        std::vector<std::pair<int64_t, double>> samples;
+        for (const auto& file : files) append_csv(file, samples);
+        std::sort(samples.begin(), samples.end());
+        samples.erase(std::unique(samples.begin(), samples.end(),
+                                  [](const auto& a, const auto& b) { return a.first == b.first; }),
+                      samples.end());
+        if (samples.size() < 2) continue;
+
+        GyroSeries series;
+        series.source = pattern + " (" + std::to_string(files.size()) +
+                        (files.size() == 1 ? " file)" : " files)");
+        for (const auto& [t, m] : samples) {
+            series.t_ns.push_back(t);
+            series.magnitude_radps.push_back(m);
         }
+        return series;
     }
-    if (files.empty()) throw std::runtime_error("no imu*.csv files in " + dir);
-    std::sort(files.begin(), files.end());
-
-    std::vector<std::pair<int64_t, double>> samples;
-    for (const auto& file : files) append_csv(file, samples);
-    std::sort(samples.begin(), samples.end());
-    samples.erase(std::unique(samples.begin(), samples.end(),
-                              [](const auto& a, const auto& b) { return a.first == b.first; }),
-                  samples.end());
-    if (samples.size() < 2) throw std::runtime_error("no gyro samples in the imu*.csv files in " + dir);
-
-    GyroSeries series;
-    for (const auto& [t, m] : samples) {
-        series.t_ns.push_back(t);
-        series.magnitude_radps.push_back(m);
-    }
-    return series;
+    throw std::runtime_error("no gyro samples in " + searched);
 }
 
 TimeAlignment align_gyro_magnitudes(const GyroSeries& reference, const GyroSeries& camera,
@@ -206,7 +235,9 @@ TimeAlignment align_gyro_magnitudes(const GyroSeries& reference, const GyroSerie
     if (coarse.score.n == 0) {
         throw std::runtime_error(
             "camera and reference IMU never overlap by half their length within +/-" +
-            std::to_string(max_lag_s) + " s; are both on the same wall clock?");
+            std::to_string(max_lag_s) +
+            " s; are both on the same wall clock? If the clocks are further apart, raise "
+            "--align-max-lag");
     }
 
     // Fine pass: 1 ms steps around the coarse peak.
