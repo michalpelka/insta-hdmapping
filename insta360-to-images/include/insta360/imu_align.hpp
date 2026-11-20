@@ -17,13 +17,19 @@ namespace insta360 {
 struct GyroSeries {
     std::vector<int64_t> t_ns;
     std::vector<double> magnitude_radps;
+    std::string source;  // the files the samples came from, for logging
 };
 
-// Reads every imu*.csv in `dir` (sorted by name, then merged by timestamp) into one
-// series. The header picks the columns, so both a Mandeye-style space-separated
-// log (`timestamp gyroX gyroY gyroZ ...`, nanoseconds, rad/s) and this tool's own
-// imu.csv (`timestamp_ns,...,gyro_x_radps,...`) are accepted. Throws
-// std::runtime_error when the folder holds no usable file.
+// Reads one IMU's logs from `dir` (sorted by name, then merged by timestamp) into one
+// series. The first of these that holds samples is used, never two mixed:
+//   1. dir/imu*.csv -- a Mandeye session's lidar IMU, or this tool's own imu.csv;
+//   2. dir/MURATA_IMU/murata_imu*.csv -- a Mandeye logger's separate Murata IMU (the
+//      only gyro in a Hesai-based session, whose imu*.csv files are header-only);
+//   3. dir/murata_imu*.csv -- `dir` is that MURATA_IMU folder itself.
+// The header picks the columns, so both a Mandeye-style space-separated log
+// (`timestamp gyroX gyroY gyroZ ...`, nanoseconds, rad/s) and this tool's own imu.csv
+// (`timestamp_ns,...,gyro_x_radps,...`) are accepted. Throws std::runtime_error when
+// none of them holds samples.
 GyroSeries read_gyro_csv_dir(const std::string& dir);
 
 struct TimeAlignment {
