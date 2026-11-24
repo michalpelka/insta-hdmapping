@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -94,7 +95,8 @@ void print_usage() {
                  "                          matching gyro magnitudes against DIR/imu*.csv,\n"
                  "                          else DIR/MURATA_IMU/murata_imu*.csv (added to\n"
                  "                          any --time-offset)\n"
-              << "  --align-max-lag SECONDS largest clock offset --align-imus searches; default 60\n"
+              << "  --align-max-lag SECONDS largest clock offset --align-imus searches; default 60,\n"
+                 "                          'inf' searches every offset where the logs overlap\n"
               << "  --time-offset SECONDS   shift every written timestamp by SECONDS; may be\n"
               << "                          fractional or negative\n"
               << "  -f, --force             write into a non-empty output directory\n"
@@ -163,8 +165,13 @@ std::optional<ParsedArgs> parse_args(int argc, char** argv) {
         } else if (token == "--align-imus") {
             args.align_imu_dir = next_value(i, token);
         } else if (token == "--align-max-lag") {
-            args.align_max_lag_s = parse_seconds(next_value(i, token), token);
-            if (args.align_max_lag_s <= 0) throw std::invalid_argument(token + " must be positive");
+            std::string value = next_value(i, token);
+            if (value == "inf" || value == "infinity") {
+                args.align_max_lag_s = std::numeric_limits<double>::infinity();
+            } else {
+                args.align_max_lag_s = parse_seconds(value, token);
+                if (args.align_max_lag_s <= 0) throw std::invalid_argument(token + " must be positive");
+            }
         } else if (token == "-f" || token == "--force") {
             args.force = true;
         } else if (token == "-q" || token == "--quiet") {
