@@ -230,14 +230,33 @@ TimeAlignment align_gyro_magnitudes(const GyroSeries& reference, const GyroSerie
     Grid cam = resample(camera, coarse_ns);
     size_t min_n = std::min(valid_count(ref), valid_count(cam)) / 2;
     if (min_n < 100) throw std::runtime_error("IMU series too short to align (need > 2 s each)");
-    int64_t max_lag = static_cast<int64_t>(std::ceil(max_lag_s * 1e9 / coarse_ns));
-    Peak coarse = search(ref, cam, -max_lag, max_lag, min_n);
+    // Only lags where the grids can overlap by min_n points are worth scoring; this
+    // also bounds the search when max_lag_s is infinite.
+    const int64_t ref_end = ref.k0 + static_cast<int64_t>(ref.values.size());
+    const int64_t cam_end = cam.k0 + static_cast<int64_t>(cam.values.size());
+    const int64_t n_min = static_cast<int64_t>(min_n);
+    int64_t lag_min = cam.k0 - ref_end + n_min;
+    int64_t lag_max = cam_end - ref.k0 - n_min;
+    const bool bounded = std::isfinite(max_lag_s);
+    int64_t max_lag = 0;
+    if (bounded) {
+        double steps = std::ceil(max_lag_s * 1e9 / coarse_ns);
+        max_lag = steps >= 4e18 ? std::numeric_limits<int64_t>::max() / 2
+                                : static_cast<int64_t>(steps);
+        lag_min = std::max(lag_min, -max_lag);
+        lag_max = std::min(lag_max, max_lag);
+    }
+    Peak coarse = lag_min <= lag_max ? search(ref, cam, lag_min, lag_max, min_n) : Peak{};
     if (coarse.score.n == 0) {
+        if (!bounded) {
+            throw std::runtime_error(
+                "camera and reference IMU never overlap by half their length at any offset");
+        }
         throw std::runtime_error(
             "camera and reference IMU never overlap by half their length within +/-" +
             std::to_string(max_lag_s) +
             " s; are both on the same wall clock? If the clocks are further apart, raise "
-            "--align-max-lag");
+            "--align-max-lag (or pass inf)");
     }
 
     // Fine pass: 1 ms steps around the coarse peak.
@@ -265,7 +284,7 @@ TimeAlignment align_gyro_magnitudes(const GyroSeries& reference, const GyroSerie
     result.offset_s = -lag_steps * fine_ns / 1e9;
     result.correlation = fine.score.r;
     result.overlap_s = fine.score.n * fine_ns / 1e9;
-    result.at_search_edge = std::abs(coarse.lag) >= max_lag;
+    result.at_search_edge = bounded && std::abs(coarse.lag) >= max_lag;
     return result;
 }
 

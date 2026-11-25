@@ -3,6 +3,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <string_view>
 
@@ -63,6 +64,16 @@ TEST(align_gyro_magnitudes_rejects_series_that_never_overlap) {
     GyroSeries reference = sample(0.0, 10.0, 200.0, 0.0, 5);
     GyroSeries camera = sample(0.0, 10.0, 1000.0, 100.0, 6);
     CHECK_THROWS(align_gyro_magnitudes(reference, camera, 5.0));
+}
+
+TEST(align_gyro_magnitudes_with_infinite_lag_finds_a_large_offset) {
+    const double inf = std::numeric_limits<double>::infinity();
+    GyroSeries reference = sample(1.0, 28.0, 200.0, 0.0, 7);
+    GyroSeries camera = sample(0.0, 30.0, 1000.0, 3600.0, 8);
+    CHECK_THROWS(align_gyro_magnitudes(reference, camera, 60.0));
+    TimeAlignment result = align_gyro_magnitudes(reference, camera, inf);
+    CHECK_NEAR(result.offset_s, -3600.0, 0.001);
+    CHECK(!result.at_search_edge);
 }
 
 TEST(read_gyro_csv_dir_merges_mandeye_and_own_formats) {

@@ -39,7 +39,7 @@ struct TimeAlignment {
     bool at_search_edge = false;  // the best lag sits at +/-max_lag_s: likely out of range
 };
 
-// Finds the offset, within +/-max_lag_s, that maximises the correlation between the
+// Finds the offset, within +/-max_lag_s (unbounded when infinite), that maximises the correlation between the
 // camera's gyro magnitude (shifted by the offset) and the reference's. A coarse
 // 10 ms search is refined on a 1 ms grid and then to sub-millisecond by fitting a
 // parabola through the peak. Only lags where the two series overlap for at least
